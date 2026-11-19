@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+.output/
+.wrangler/
+.open-next/
+worker-configuration.d.ts
+
+# Git worktrees
+.worktrees/
+.worktrees
+
+# AI agents (settings/memory はローカル秘匿、skills だけ追跡)
+.claude/*
+!.claude/skills
+.claude-mem
+.gemini/*
+!.gemini/skills
+.codex/*
+!.codex/skills
+.agents/*
+!.agents/skills
+
+# Environment
+.env
+.env.local
+.env.*.local
+.dev.vars
+
+# Editor
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# TypeScript
+*.tsbuildinfo

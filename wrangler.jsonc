@@ -1,0 +1,9 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "funya-ojisan",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-01-01",
+	"vars": {
+		"TARGET_CHANNEL_ID": ""
+	}
+}

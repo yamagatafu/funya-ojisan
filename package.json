@@ -1,0 +1,40 @@
+{
+	"name": "anonymous_transporter",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Anonymous message transporter Discord bot built with discord-hono on Cloudflare Workers",
+	"packageManager": "pnpm@10.34.5",
+	"engines": {
+		"node": ">=22.0.0"
+	},
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy",
+		"register": "node --env-file-if-exists=.dev.vars scripts/register.ts",
+		"cf-typegen": "wrangler types",
+		"lint": "biome check .",
+		"format": "biome format --write .",
+		"typecheck": "tsgo --noEmit",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"prepare": "husky"
+	},
+	"lint-staged": {
+		"*.{ts,tsx,js,mjs,cjs,json,jsonc}": [
+			"biome check --write --no-errors-on-unmatched"
+		]
+	},
+	"dependencies": {
+		"discord-api-types": "^0.38.59",
+		"discord-hono": "^0.23.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.6.8",
+		"@typescript/native-preview": "^7.0.0-dev.20260707.2",
+		"husky": "^9.1.7",
+		"lint-staged": "^17.6.1",
+		"vitest": "^5.1.1",
+		"wrangler": "^4.165.0"
+	}
+}
