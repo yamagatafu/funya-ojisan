@@ -880,6 +880,7 @@ describe('anonymous transporter bot', () => {
 			(args) =>
 				typeof args[0] === 'string' &&
 				args[0].includes('[ALERT]') &&
+				args[0].includes('requires manual deletion') &&
 				args[0].includes(TARGET_CHANNEL_ID) &&
 				args[0].includes('untracked-panel-99'),
 		);
