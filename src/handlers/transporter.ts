@@ -23,6 +23,7 @@ const KV_PUT_MAX_ATTEMPTS = 3;
 const KV_PUT_BASE_DELAY_MS = 1000;
 const DELETE_ROLLBACK_MAX_ATTEMPTS = 3;
 const DELETE_ROLLBACK_BASE_DELAY_MS = 1000;
+const MAX_RETRY_AFTER_MS = 20_000;
 
 const openModalButton = makeButton(BUTTON_ID, '匿名メッセージを送る', buttonStyle.Primary);
 
@@ -150,6 +151,30 @@ class PanelRollbackFailedError extends Error {
 	}
 }
 
+async function extractRetryAfterMs(response: Pick<Response, 'headers' | 'text'>): Promise<number | null> {
+	const headerValue = response.headers.get('retry-after');
+	if (headerValue) {
+		const seconds = Number(headerValue);
+		if (Number.isFinite(seconds) && seconds >= 0) {
+			return Math.ceil(seconds * 1000);
+		}
+	}
+
+	try {
+		const bodyText = await response.text();
+		const parsed: unknown = JSON.parse(bodyText);
+		if (isRecord(parsed) && typeof parsed.retry_after === 'number' && Number.isFinite(parsed.retry_after)) {
+			if (parsed.retry_after >= 0) {
+				return Math.ceil(parsed.retry_after * 1000);
+			}
+		}
+	} catch {
+		// ignore non-JSON body
+	}
+
+	return null;
+}
+
 async function deletePanelMessageWithRetry(params: {
 	rest: RestClient;
 	channelId: string;
@@ -158,15 +183,34 @@ async function deletePanelMessageWithRetry(params: {
 	const { rest, channelId, messageId } = params;
 
 	for (let attempt = 1; attempt <= DELETE_ROLLBACK_MAX_ATTEMPTS; attempt++) {
+		let delayMs = DELETE_ROLLBACK_BASE_DELAY_MS * attempt;
+
 		try {
 			const response = await rest('DELETE', $channels$_$messages$_, [channelId, messageId]);
 			if (response.ok || response.status === 404) {
 				return true;
 			}
-			const errorText = await response.text();
-			console.error(
-				`[ALERT] Rollback DELETE failed (attempt ${attempt}/${DELETE_ROLLBACK_MAX_ATTEMPTS}): channelId=${channelId}, messageId=${messageId}, status=${response.status}, body=${errorText}`,
-			);
+
+			if (response.status === 429) {
+				const retryAfterMs = await extractRetryAfterMs(response);
+				if (retryAfterMs !== null) {
+					if (retryAfterMs > MAX_RETRY_AFTER_MS) {
+						console.error(
+							`[ALERT] Rollback DELETE rate limited beyond worker budget (${retryAfterMs}ms > ${MAX_RETRY_AFTER_MS}ms): channelId=${channelId}, messageId=${messageId}`,
+						);
+						break;
+					}
+					delayMs = retryAfterMs;
+				}
+				console.error(
+					`[ALERT] Rollback DELETE rate limited (attempt ${attempt}/${DELETE_ROLLBACK_MAX_ATTEMPTS}, wait ${delayMs}ms): channelId=${channelId}, messageId=${messageId}`,
+				);
+			} else {
+				const errorText = await response.text();
+				console.error(
+					`[ALERT] Rollback DELETE failed (attempt ${attempt}/${DELETE_ROLLBACK_MAX_ATTEMPTS}): channelId=${channelId}, messageId=${messageId}, status=${response.status}, body=${errorText}`,
+				);
+			}
 		} catch (error) {
 			console.error(
 				`[ALERT] Rollback DELETE threw (attempt ${attempt}/${DELETE_ROLLBACK_MAX_ATTEMPTS}): channelId=${channelId}, messageId=${messageId}`,
@@ -175,7 +219,7 @@ async function deletePanelMessageWithRetry(params: {
 		}
 
 		if (attempt < DELETE_ROLLBACK_MAX_ATTEMPTS) {
-			await new Promise((resolve) => setTimeout(resolve, DELETE_ROLLBACK_BASE_DELAY_MS * attempt));
+			await new Promise((resolve) => setTimeout(resolve, delayMs));
 		}
 	}
 
@@ -220,6 +264,33 @@ async function postAndReplacePanelMessage(params: {
 		]),
 	).filter((id) => id !== newMessageId);
 
+	const initialState = {
+		currentId: newMessageId,
+		pendingDeleteIds: deleteTargets,
+	} satisfies PanelState;
+
+	let persistedKey: 'primary' | 'backup' = 'primary';
+	try {
+		await putWithBackoff(kv, kvKey, JSON.stringify(initialState));
+	} catch (primaryPutError) {
+		console.error('Failed to persist panel state to primary KV key after retries:', primaryPutError);
+		try {
+			await kv.put(backupKey, JSON.stringify(initialState));
+			persistedKey = 'backup';
+		} catch (backupPutError) {
+			console.error('Failed to persist panel state to backup KV key; rolling back posted panel:', backupPutError);
+			const rolledBack = await deletePanelMessageWithRetry({
+				rest,
+				channelId,
+				messageId: newMessageId,
+			});
+			if (!rolledBack) {
+				throw new PanelRollbackFailedError(channelId, newMessageId);
+			}
+			throw backupPutError;
+		}
+	}
+
 	const remainingPendingIds: string[] = [];
 	for (const targetId of deleteTargets) {
 		try {
@@ -235,40 +306,33 @@ async function postAndReplacePanelMessage(params: {
 		}
 	}
 
-	const nextState = {
-		currentId: newMessageId,
-		pendingDeleteIds: remainingPendingIds,
-	} satisfies PanelState;
-	const serializedState = JSON.stringify(nextState);
+	const cleanedUpAnyTarget = remainingPendingIds.length < deleteTargets.length;
+	const needsBackupClear = persistedKey === 'primary' && Boolean(backupRaw);
 
-	try {
-		await putWithBackoff(kv, kvKey, serializedState);
-		if (backupRaw) {
-			try {
-				await kv.put(backupKey, '');
-			} catch (clearError) {
-				console.error('Failed to clear backup KV key:', clearError);
-			}
-		}
-		return true;
-	} catch (primaryPutError) {
-		console.error('Failed to persist panel state to primary KV key after retries:', primaryPutError);
+	if (cleanedUpAnyTarget) {
+		const finalizedState = {
+			currentId: newMessageId,
+			pendingDeleteIds: remainingPendingIds,
+		} satisfies PanelState;
+		const serializedFinalized = JSON.stringify(finalizedState);
+		const targetKey = persistedKey === 'primary' ? kvKey : backupKey;
+
 		try {
-			await kv.put(backupKey, serializedState);
-			return true;
-		} catch (backupPutError) {
-			console.error('Failed to persist panel state to backup KV key; rolling back posted panel:', backupPutError);
-			const rolledBack = await deletePanelMessageWithRetry({
-				rest,
-				channelId,
-				messageId: newMessageId,
-			});
-			if (!rolledBack) {
-				throw new PanelRollbackFailedError(channelId, newMessageId);
-			}
-			throw backupPutError;
+			await putWithBackoff(kv, targetKey, serializedFinalized);
+		} catch (finalizeError) {
+			console.error('Failed to update cleaned-up pendingDeleteIds in KV:', finalizeError);
 		}
 	}
+
+	if (needsBackupClear) {
+		try {
+			await kv.put(backupKey, '');
+		} catch (clearError) {
+			console.error('Failed to clear backup KV key:', clearError);
+		}
+	}
+
+	return true;
 }
 
 export const panelCommand = factory.command(

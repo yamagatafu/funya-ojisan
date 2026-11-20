@@ -747,10 +747,12 @@ describe('anonymous transporter bot', () => {
 		});
 	});
 
-	it('rolls back posted panel and notifies accurately when both primary and backup KV puts fail', async () => {
+	it('preserves existing panel and rolls back only new panel when both primary and backup KV puts fail', async () => {
 		vi.useFakeTimers();
 		const app = createTestApp();
-		const { env, kv } = createTestEnv();
+		const { env, kv, store } = createTestEnv({
+			[`panel_message:${TARGET_CHANNEL_ID}`]: 'existing-panel-1',
+		});
 		const { ctx, flush } = createExecutionContext();
 		vi.spyOn(console, 'error').mockImplementation(() => {});
 		const putMock = vi.spyOn(kv, 'put').mockRejectedValue(new Error('429 Too Many Requests'));
@@ -784,17 +786,19 @@ describe('anonymous transporter bot', () => {
 		await flushPromise;
 
 		expect(putMock).toHaveBeenCalledTimes(4);
-		expect(fetchMock.mock.calls[2]?.[0]).toBe(
+		const deleteCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE');
+		expect(deleteCalls).toHaveLength(1);
+		expect(deleteCalls[0]?.[0]).toBe(
 			`https://discord.com/api/v10/channels/${TARGET_CHANNEL_ID}/messages/new-panel-msg-2`,
 		);
-		expect(fetchMock.mock.calls[2]?.[1]?.method).toBe('DELETE');
+		expect(store.get(`panel_message:${TARGET_CHANNEL_ID}`)).toBe('existing-panel-1');
 		const [, followupInit] = fetchMock.mock.calls[3]!;
 		expect(JSON.parse(String(followupInit?.body))).toMatchObject({
 			content: 'メッセージは送信しましたが、送信パネルの更新に失敗しました。',
 		});
 	});
 
-	it('retries rollback DELETE when Discord returns 429 and succeeds on retry', async () => {
+	it('waits until Retry-After before retrying rollback DELETE on 429', async () => {
 		vi.useFakeTimers();
 		const app = createTestApp();
 		const { env, kv } = createTestEnv();
@@ -816,7 +820,15 @@ describe('anonymous transporter bot', () => {
 					headers: { 'content-type': 'application/json' },
 				}),
 			)
-			.mockResolvedValueOnce(new Response('Rate Limited', { status: 429 }))
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ retry_after: 5 }), {
+					status: 429,
+					headers: {
+						'content-type': 'application/json',
+						'Retry-After': '5',
+					},
+				}),
+			)
 			.mockResolvedValueOnce(new Response(null, { status: 204 }))
 			.mockResolvedValue(new Response(null, { status: 200 }));
 
@@ -828,7 +840,17 @@ describe('anonymous transporter bot', () => {
 
 		await app.fetch(createInteractionRequest(interaction), env, ctx);
 		const flushPromise = flush();
-		await vi.runAllTimersAsync();
+
+		// kv.put リトライ分 (1000ms + 2000ms) を進めて 1回目の DELETE (429 Retry-After: 5) に到達させる
+		await vi.advanceTimersByTimeAsync(3000);
+		expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE')).toHaveLength(1);
+
+		// 5000ms 未満 (4999ms) ではまだ 2回目の DELETE は送られない
+		await vi.advanceTimersByTimeAsync(4999);
+		expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE')).toHaveLength(1);
+
+		// 残り 1ms を進めて合計 5000ms 到達で 2回目の DELETE が送られる
+		await vi.advanceTimersByTimeAsync(1);
 		await flushPromise;
 
 		const deleteCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE');
@@ -840,6 +862,54 @@ describe('anonymous transporter bot', () => {
 		expect(JSON.parse(String(followupInit?.body))).toMatchObject({
 			content: 'メッセージは送信しましたが、送信パネルの更新に失敗しました。',
 		});
+	});
+
+	it('does not retry rollback DELETE and alerts immediately when retry_after exceeds worker budget', async () => {
+		vi.useFakeTimers();
+		const app = createTestApp();
+		const { env, kv } = createTestEnv();
+		const { ctx, flush } = createExecutionContext();
+		const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.spyOn(kv, 'put').mockRejectedValue(new Error('KV Down'));
+
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'untracked-panel-budget' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ retry_after: 25 }), {
+					status: 429,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const interaction = createPanelCommandInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		const flushPromise = flush();
+		await vi.runAllTimersAsync();
+		await flushPromise;
+
+		const deleteCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE');
+		expect(deleteCalls).toHaveLength(1);
+
+		const alertCall = consoleErrorSpy.mock.calls.find(
+			(args) =>
+				typeof args[0] === 'string' &&
+				args[0].includes('[ALERT]') &&
+				args[0].includes('requires manual deletion') &&
+				args[0].includes(TARGET_CHANNEL_ID) &&
+				args[0].includes('untracked-panel-budget'),
+		);
+		expect(alertCall).toBeDefined();
 	});
 
 	it('alerts with channelId and messageId when rollback DELETE fails 3 times with 500', async () => {
