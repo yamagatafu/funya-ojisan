@@ -4,6 +4,26 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2026-01-01",
 	"vars": {
-		"TARGET_CHANNEL_ID": ""
+		"TARGET_CHANNEL_ID": "1572996233553907744"
+	},
+	"kv_namespaces": [
+		{
+			"binding": "PANEL_KV",
+			"id": "098cee9f95ca4145833bef86c49e4f97"
+		}
+	],
+	// Preview URL は Discord の Interactions Endpoint URL として登録しない前提で同一 ID を指定
+	// DISCORD_GUILD_ID は scripts/register.ts 用だが、Workers Builds 側の環境変数定義との整合のため記載
+	"previews": {
+		"vars": {
+			"TARGET_CHANNEL_ID": "1572996233553907744",
+			"DISCORD_GUILD_ID": "1435591243794092065"
+		},
+		"kv_namespaces": [
+			{
+				"binding": "PANEL_KV",
+				"id": "098cee9f95ca4145833bef86c49e4f97"
+			}
+		]
 	}
 }

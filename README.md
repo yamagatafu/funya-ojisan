@@ -4,9 +4,13 @@
 
 ## 機能
 
-- `/panel`: 匿名メッセージ送信用のボタン付きメッセージをチャンネルに投稿します。
+- `/panel`: 匿名メッセージ送信用のボタン付きメッセージを `TARGET_CHANNEL_ID` に投稿し、メッセージ ID を KV (`PANEL_KV`) に保存したうえで前回のボタンメッセージを削除します（`MANAGE_MESSAGES` 権限が必要）。
 - ボタン押下 (`open_anonymous_modal`): 入力用のモーダルを表示します。
-- モーダル送信 (`anonymous_modal`): 入力内容を Discord REST API (`POST /channels/{channel.id}/messages`) 経由で指定チャンネルに転送します（Webhook 不使用）。
+- モーダル送信 (`anonymous_modal`): 入力内容を Discord REST API (`POST /channels/{channel.id}/messages`) 経由で `TARGET_CHANNEL_ID` に転送します（Webhook 不使用）。転送完了後、新しいボタンメッセージを投稿して KV に保存したうえで、前回のボタンメッセージを削除します。
+- `TARGET_CHANNEL_ID` 以外のチャンネルからのコマンド・ボタン・モーダル操作は無視（Ephemeral 応答）します。
+
+> [!NOTE]
+> Cloudflare Workers KV は結果整合性および同一キーへの書込み制限（1 秒あたり 1 回）があるため、短時間の連続投稿や同時送信が重なった場合に一時的にパネルが重複することがあります。KV に未追跡のパネルが残った場合は不要なパネルを手動で削除したうえで、追跡用の新規パネルを再設置するために管理者が `/panel` を実行してください。
 
 ## セットアップ
 
@@ -24,13 +28,13 @@ pnpm install
 cp .dev.vars.example .dev.vars
 ```
 
-| 変数名                   | 説明                                                          |
-| ------------------------ | ------------------------------------------------------------- |
-| `DISCORD_APPLICATION_ID` | Discord アプリケーション ID                                   |
-| `DISCORD_PUBLIC_KEY`     | Discord アプリケーションの Public Key                         |
-| `DISCORD_TOKEN`          | Discord Bot トークン                                          |
-| `TARGET_CHANNEL_ID`      | 転送先チャンネル ID                                           |
-| `DISCORD_GUILD_ID`       | （任意）ギルド限定で即時にコマンド登録したい場合のサーバー ID |
+| 変数名                   | 説明                                                              |
+| ------------------------ | ----------------------------------------------------------------- |
+| `DISCORD_APPLICATION_ID` | Discord アプリケーション ID                                       |
+| `DISCORD_PUBLIC_KEY`     | Discord アプリケーションの Public Key                             |
+| `DISCORD_TOKEN`          | Discord Bot トークン                                              |
+| `TARGET_CHANNEL_ID`      | 転送先チャンネル ID（本番用は `wrangler.jsonc` の `vars` で管理） |
+| `DISCORD_GUILD_ID`       | （任意）ギルド限定で即時にコマンド登録したい場合のサーバー ID     |
 
 ### 3. スラッシュコマンドの登録
 
@@ -46,13 +50,16 @@ pnpm dev
 
 ### 5. デプロイ (Cloudflare Workers)
 
-本番環境用のシークレット・変数を設定してデプロイします。
+本番環境用のシークレットを設定し、`wrangler.jsonc` の `vars.TARGET_CHANNEL_ID` と `kv_namespaces`（バインディング名 `PANEL_KV`）を確認したうえでデプロイします。
+
+> [!IMPORTANT]
+> すでに本番環境に `wrangler secret put TARGET_CHANNEL_ID` でシークレットを登録している場合、`wrangler.jsonc` の `vars.TARGET_CHANNEL_ID` と名前が衝突して `wrangler deploy` が失敗します。移行時は事前に `pnpm exec wrangler secret delete TARGET_CHANNEL_ID` を実行してください。
+> また、`wrangler.jsonc` の `previews` ブロックでは Preview URL を Discord の Interactions Endpoint URL として登録しない前提で本番と同じ `TARGET_CHANNEL_ID` / `PANEL_KV` ID を指定しています。プレビュー環境で実動作テストを行う場合は、専用チャンネルと専用 KV Namespace に分離してください。
 
 ```bash
 pnpm exec wrangler secret put DISCORD_APPLICATION_ID
 pnpm exec wrangler secret put DISCORD_PUBLIC_KEY
 pnpm exec wrangler secret put DISCORD_TOKEN
-pnpm exec wrangler secret put TARGET_CHANNEL_ID
 pnpm deploy
 ```
 
