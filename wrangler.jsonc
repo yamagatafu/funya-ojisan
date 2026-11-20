@@ -4,7 +4,8 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2026-01-01",
 	"vars": {
-		"TARGET_CHANNEL_ID": "1572996233553907744"
+		"TARGET_CHANNEL_ID": "1572996233553907744",
+		"DISCORD_GUILD_ID": "1435591243794092065"
 	},
 	"kv_namespaces": [
 		{
