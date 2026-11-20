@@ -1,3 +1,4 @@
+import { PermissionFlagsBits } from 'discord-api-types/v10';
 import {
 	$channels$_$messages,
 	$channels$_$messages$_,
@@ -7,15 +8,17 @@ import {
 	makeModal,
 	makeSlashCommand,
 	makeTextInput,
+	permissionFlags,
 	textInputStyle,
 } from 'discord-hono';
 import { factory } from '../factory.ts';
-import type { PanelKvStore } from '../types.ts';
+import type { AppBindings, PanelKvStore } from '../types.ts';
 
 const BUTTON_ID = 'open_anonymous_modal';
 const MODAL_ID = 'anonymous_modal';
 const INPUT_ID = 'message_content';
 const PANEL_KV_KEY_PREFIX = 'panel_message:';
+const MAX_PENDING_DELETE_IDS = 10;
 
 const openModalButton = makeButton(BUTTON_ID, '匿名メッセージを送る', buttonStyle.Primary);
 
@@ -36,14 +39,91 @@ const anonymousModal = makeModal(MODAL_ID, '匿名メッセージ送信', [
 
 type RestClient = Parameters<Parameters<typeof factory.command>[1]>[0]['rest'];
 
+interface PanelState {
+	currentId: string | null;
+	pendingDeleteIds: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null;
+}
+
+function extractMessageId(payload: unknown): string | null {
+	if (!isRecord(payload)) {
+		return null;
+	}
+	return typeof payload.id === 'string' && payload.id.length > 0 ? payload.id : null;
+}
+
+function parsePanelState(raw: string | null): PanelState {
+	if (!raw) {
+		return { currentId: null, pendingDeleteIds: [] };
+	}
+
+	if (!raw.startsWith('{')) {
+		return { currentId: raw, pendingDeleteIds: [] };
+	}
+
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!isRecord(parsed)) {
+			return { currentId: null, pendingDeleteIds: [] };
+		}
+
+		const currentId = typeof parsed.currentId === 'string' && parsed.currentId.length > 0 ? parsed.currentId : null;
+		const pendingDeleteIds = Array.isArray(parsed.pendingDeleteIds)
+			? parsed.pendingDeleteIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+			: [];
+
+		return { currentId, pendingDeleteIds };
+	} catch {
+		return { currentId: null, pendingDeleteIds: [] };
+	}
+}
+
+function hasManageMessagesPermission(permissions: string | undefined): boolean {
+	if (!permissions) {
+		return false;
+	}
+
+	try {
+		const bits = BigInt(permissions);
+		const required = PermissionFlagsBits.ManageMessages | PermissionFlagsBits.Administrator;
+		return (bits & required) !== 0n;
+	} catch {
+		return false;
+	}
+}
+
+function validateChannelAndEnv(params: {
+	env: AppBindings;
+	channelId: string | undefined;
+}): { ok: true; targetChannelId: string; kv: PanelKvStore } | { ok: false; message: string } {
+	const targetChannelId = params.env.TARGET_CHANNEL_ID?.trim();
+	if (!targetChannelId) {
+		return { ok: false, message: '送信先チャンネルが設定されていません。管理者に連絡してください。' };
+	}
+
+	if (!params.env.PANEL_KV) {
+		console.error('PANEL_KV binding is not configured.');
+		return { ok: false, message: 'KV ストレージが設定されていません。管理者に連絡してください。' };
+	}
+
+	if (params.channelId !== targetChannelId) {
+		return { ok: false, message: 'このチャンネルでは使用できません。' };
+	}
+
+	return { ok: true, targetChannelId, kv: params.env.PANEL_KV };
+}
+
 async function postAndReplacePanelMessage(params: {
 	rest: RestClient;
-	kv: PanelKvStore | undefined;
+	kv: PanelKvStore;
 	channelId: string;
 }): Promise<boolean> {
 	const { rest, kv, channelId } = params;
 	const kvKey = `${PANEL_KV_KEY_PREFIX}${channelId}`;
-	const oldMessageId = kv ? await kv.get(kvKey) : null;
+	const state = parsePanelState(await kv.get(kvKey));
 
 	const postResponse = await rest('POST', $channels$_$messages, [channelId], panelMessagePayload);
 	if (!postResponse.ok) {
@@ -52,87 +132,109 @@ async function postAndReplacePanelMessage(params: {
 		return false;
 	}
 
-	const postedMessage = await postResponse.json();
+	const postedPayload: unknown = await postResponse.json();
+	const newMessageId = extractMessageId(postedPayload);
+	if (!newMessageId) {
+		console.error('Posted panel message response did not contain a valid id.');
+		return false;
+	}
 
-	if (oldMessageId && oldMessageId !== postedMessage.id) {
-		const deleteResponse = await rest('DELETE', $channels$_$messages$_, [channelId, oldMessageId]);
-		if (!deleteResponse.ok && deleteResponse.status !== 404) {
-			const errorText = await deleteResponse.text();
-			console.error('Failed to delete previous panel message:', deleteResponse.status, errorText);
+	const deleteTargets = Array.from(
+		new Set([...(state.currentId ? [state.currentId] : []), ...state.pendingDeleteIds]),
+	).filter((id) => id !== newMessageId);
+
+	const remainingPendingIds: string[] = [];
+	for (const targetId of deleteTargets) {
+		try {
+			const deleteResponse = await rest('DELETE', $channels$_$messages$_, [channelId, targetId]);
+			if (!deleteResponse.ok && deleteResponse.status !== 404) {
+				const errorText = await deleteResponse.text();
+				console.error('Failed to delete previous panel message:', targetId, deleteResponse.status, errorText);
+				remainingPendingIds.push(targetId);
+			}
+		} catch (error) {
+			console.error('Unexpected error while deleting previous panel message:', targetId, error);
+			remainingPendingIds.push(targetId);
 		}
 	}
 
-	if (kv) {
-		await kv.put(kvKey, postedMessage.id);
-	}
+	const nextState = {
+		currentId: newMessageId,
+		pendingDeleteIds: remainingPendingIds.slice(-MAX_PENDING_DELETE_IDS),
+	} satisfies PanelState;
 
+	await kv.put(kvKey, JSON.stringify(nextState));
 	return true;
 }
 
-export const panelCommand = factory.command(makeSlashCommand('panel', '匿名メッセージ送信ボタンを表示します'), (c) => {
-	const targetChannelId = c.env.TARGET_CHANNEL_ID?.trim();
-	if (!targetChannelId) {
-		return c.flags('EPHEMERAL').res('送信先チャンネルが設定されていません。管理者に連絡してください。');
-	}
-
-	if (c.interaction.channel_id !== targetChannelId) {
-		return c.flags('EPHEMERAL').res('このチャンネルでは使用できません。');
-	}
-
-	return c.flags('EPHEMERAL').resDefer(async (deferred) => {
-		try {
-			const posted = await postAndReplacePanelMessage({
-				rest: deferred.rest,
-				kv: deferred.env.PANEL_KV,
-				channelId: targetChannelId,
-			});
-
-			if (!posted) {
-				await deferred.followup('送信パネルの投稿に失敗しました。');
-				return;
-			}
-
-			await deferred.followup('送信パネルを設置しました。');
-		} catch (error) {
-			console.error('Unexpected error while posting panel message:', error);
-			await deferred.followup('送信パネルの設置中にエラーが発生しました。');
+export const panelCommand = factory.command(
+	makeSlashCommand('panel', '匿名メッセージ送信ボタンを表示します').default_member_permissions(
+		String(permissionFlags('MANAGE_MESSAGES')),
+	),
+	(c) => {
+		const validation = validateChannelAndEnv({
+			env: c.env,
+			channelId: c.interaction.channel_id,
+		});
+		if (!validation.ok) {
+			return c.flags('EPHEMERAL').res(validation.message);
 		}
-	});
-});
+
+		if (!hasManageMessagesPermission(c.interaction.member?.permissions)) {
+			return c.flags('EPHEMERAL').res('このコマンドを実行する権限がありません。');
+		}
+
+		return c.flags('EPHEMERAL').resDefer(async (deferred) => {
+			try {
+				const posted = await postAndReplacePanelMessage({
+					rest: deferred.rest,
+					kv: validation.kv,
+					channelId: validation.targetChannelId,
+				});
+
+				if (!posted) {
+					await deferred.followup('送信パネルの投稿に失敗しました。');
+					return;
+				}
+
+				await deferred.followup('送信パネルを設置しました。');
+			} catch (error) {
+				console.error('Unexpected error while posting panel message:', error);
+				await deferred.followup('送信パネルの設置中にエラーが発生しました。');
+			}
+		});
+	},
+);
 
 export const openModalComponent = factory.component(openModalButton, (c) => {
-	const targetChannelId = c.env.TARGET_CHANNEL_ID?.trim();
-	if (!targetChannelId) {
-		return c.flags('EPHEMERAL').res('送信先チャンネルが設定されていません。管理者に連絡してください。');
-	}
-
-	if (c.interaction.channel_id !== targetChannelId) {
-		return c.flags('EPHEMERAL').res('このチャンネルでは使用できません。');
+	const validation = validateChannelAndEnv({
+		env: c.env,
+		channelId: c.interaction.channel_id,
+	});
+	if (!validation.ok) {
+		return c.flags('EPHEMERAL').res(validation.message);
 	}
 
 	return c.resModal(anonymousModal);
 });
 
 export const submitAnonymousModal = factory.modal(anonymousModal, (c) => {
-	const targetChannelId = c.env.TARGET_CHANNEL_ID?.trim();
-	if (!targetChannelId) {
-		return c.flags('EPHEMERAL').res('送信先チャンネルが設定されていません。管理者に連絡してください。');
-	}
-
-	if (c.interaction.channel_id !== targetChannelId) {
-		return c.flags('EPHEMERAL').res('このチャンネルでは使用できません。');
+	const validation = validateChannelAndEnv({
+		env: c.env,
+		channelId: c.interaction.channel_id,
+	});
+	if (!validation.ok) {
+		return c.flags('EPHEMERAL').res(validation.message);
 	}
 
 	const content = c.var[INPUT_ID]?.trim();
+	if (!content) {
+		return c.flags('EPHEMERAL').res('送信内容が空のため送信できませんでした。');
+	}
 
 	return c.flags('EPHEMERAL').resDefer(async (deferred) => {
-		if (!content) {
-			await deferred.followup('送信内容が空のため送信できませんでした。');
-			return;
-		}
-
 		try {
-			const response = await deferred.rest('POST', $channels$_$messages, [targetChannelId], {
+			const response = await deferred.rest('POST', $channels$_$messages, [validation.targetChannelId], {
 				content,
 				allowed_mentions: { parse: [] },
 			});
@@ -143,17 +245,28 @@ export const submitAnonymousModal = factory.modal(anonymousModal, (c) => {
 				await deferred.followup('メッセージの転送に失敗しました。時間をおいて再度お試しください。');
 				return;
 			}
-
-			await postAndReplacePanelMessage({
-				rest: deferred.rest,
-				kv: deferred.env.PANEL_KV,
-				channelId: targetChannelId,
-			});
-
-			await deferred.followup('メッセージを送信しました。');
 		} catch (error) {
 			console.error('Unexpected error while forwarding message:', error);
 			await deferred.followup('メッセージの送信中にエラーが発生しました。');
+			return;
+		}
+
+		try {
+			const replaced = await postAndReplacePanelMessage({
+				rest: deferred.rest,
+				kv: validation.kv,
+				channelId: validation.targetChannelId,
+			});
+
+			if (!replaced) {
+				await deferred.followup('メッセージは送信しましたが、送信パネルの更新に失敗しました。');
+				return;
+			}
+
+			await deferred.followup('メッセージを送信しました。');
+		} catch (error) {
+			console.error('Unexpected error while replacing panel message:', error);
+			await deferred.followup('メッセージは送信しましたが、送信パネルの更新に失敗しました。');
 		}
 	});
 });
