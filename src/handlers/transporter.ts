@@ -19,7 +19,6 @@ const MODAL_ID = 'anonymous_modal';
 const INPUT_ID = 'message_content';
 const PANEL_KV_KEY_PREFIX = 'panel_message:';
 const PANEL_BACKUP_KV_KEY_PREFIX = 'panel_backup:';
-const MAX_PENDING_DELETE_IDS = 10;
 const KV_PUT_MAX_ATTEMPTS = 3;
 const KV_PUT_BASE_DELAY_MS = 1000;
 const DELETE_ROLLBACK_MAX_ATTEMPTS = 3;
@@ -238,7 +237,7 @@ async function postAndReplacePanelMessage(params: {
 
 	const nextState = {
 		currentId: newMessageId,
-		pendingDeleteIds: remainingPendingIds.slice(-MAX_PENDING_DELETE_IDS),
+		pendingDeleteIds: remainingPendingIds,
 	} satisfies PanelState;
 	const serializedState = JSON.stringify(nextState);
 

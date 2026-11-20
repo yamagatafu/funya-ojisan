@@ -374,6 +374,76 @@ describe('anonymous transporter bot', () => {
 		});
 	});
 
+	it('retains all 11 failed deletion ids without slicing and cleans them all up on next replacement', async () => {
+		const app = createTestApp();
+		const pendingIds = Array.from({ length: 10 }, (_, i) => `old-pending-${i + 1}`);
+		const { env, store } = createTestEnv({
+			[`panel_message:${TARGET_CHANNEL_ID}`]: JSON.stringify({
+				currentId: 'current-panel-0',
+				pendingDeleteIds: pendingIds,
+			}),
+		});
+		const { ctx, flush } = createExecutionContext();
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+			const url = String(input);
+			if (init?.method === 'POST' && url.endsWith('/messages')) {
+				return new Response(JSON.stringify({ id: 'new-panel-11' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				});
+			}
+			if (init?.method === 'DELETE') {
+				return new Response('Server Error', { status: 500 });
+			}
+			return new Response(null, { status: 200 });
+		});
+
+		const interaction = createPanelCommandInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		await flush();
+
+		const expectedPending = ['current-panel-0', ...pendingIds];
+		expect(expectedPending).toHaveLength(11);
+		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
+			currentId: 'new-panel-11',
+			pendingDeleteIds: expectedPending,
+		});
+
+		const deletedUrls: string[] = [];
+		fetchMock.mockImplementation(async (input, init) => {
+			const url = String(input);
+			if (init?.method === 'POST' && url.endsWith('/messages')) {
+				return new Response(JSON.stringify({ id: 'final-panel-12' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				});
+			}
+			if (init?.method === 'DELETE') {
+				deletedUrls.push(url);
+				return new Response(null, { status: 204 });
+			}
+			return new Response(null, { status: 200 });
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		await flush();
+
+		expect(deletedUrls).toHaveLength(12);
+		for (const id of ['new-panel-11', ...expectedPending]) {
+			expect(deletedUrls).toContain(`https://discord.com/api/v10/channels/${TARGET_CHANNEL_ID}/messages/${id}`);
+		}
+		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
+			currentId: 'final-panel-12',
+			pendingDeleteIds: [],
+		});
+	});
+
 	it('rejects /panel when member lacks ManageMessages permission', async () => {
 		const app = createTestApp();
 		const { env } = createTestEnv();
