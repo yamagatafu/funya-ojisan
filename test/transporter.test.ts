@@ -102,8 +102,9 @@ describe('anonymous transporter bot', () => {
 
 	it('posts a panel button message, deletes previous one via KV, and saves new message id on /panel', async () => {
 		const app = createTestApp();
+		const targetChannelId = '987654321098765432';
 		const { env, store } = createTestEnv({
-			'panel_message:111': 'old-panel-msg-1',
+			[`panel_message:${targetChannelId}`]: 'old-panel-msg-1',
 		});
 		const { ctx, flush } = createExecutionContext();
 
@@ -128,8 +129,8 @@ describe('anonymous transporter bot', () => {
 			entitlements: [],
 			attachment_size_limit: 26214400,
 			locale: Locale.Japanese,
-			channel: { id: '111', type: 0 },
-			channel_id: '111',
+			channel: { id: targetChannelId, type: 0 },
+			channel_id: targetChannelId,
 			data: {
 				id: '200',
 				name: 'panel',
@@ -151,7 +152,7 @@ describe('anonymous transporter bot', () => {
 		expect(fetchMock).toHaveBeenCalledTimes(3);
 
 		const [postUrl, postInit] = fetchMock.mock.calls[0]!;
-		expect(postUrl).toBe('https://discord.com/api/v10/channels/111/messages');
+		expect(postUrl).toBe(`https://discord.com/api/v10/channels/${targetChannelId}/messages`);
 		expect(postInit?.method).toBe('POST');
 		expect(JSON.parse(String(postInit?.body))).toMatchObject({
 			components: [
@@ -168,7 +169,7 @@ describe('anonymous transporter bot', () => {
 		});
 
 		const [deleteUrl, deleteInit] = fetchMock.mock.calls[1]!;
-		expect(deleteUrl).toBe('https://discord.com/api/v10/channels/111/messages/old-panel-msg-1');
+		expect(deleteUrl).toBe(`https://discord.com/api/v10/channels/${targetChannelId}/messages/old-panel-msg-1`);
 		expect(deleteInit?.method).toBe('DELETE');
 
 		const [followupUrl, followupInit] = fetchMock.mock.calls[2]!;
@@ -177,7 +178,45 @@ describe('anonymous transporter bot', () => {
 			content: '送信パネルを設置しました。',
 		});
 
-		expect(store.get('panel_message:111')).toBe('new-panel-msg-2');
+		expect(store.get(`panel_message:${targetChannelId}`)).toBe('new-panel-msg-2');
+	});
+
+	it('ignores /panel when executed outside TARGET_CHANNEL_ID', async () => {
+		const app = createTestApp();
+		const { env } = createTestEnv();
+		const { ctx } = createExecutionContext();
+		const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+		const interaction = {
+			id: '104',
+			application_id: env.DISCORD_APPLICATION_ID,
+			type: InteractionType.ApplicationCommand,
+			token: 'interaction-token',
+			version: 1,
+			app_permissions: '0',
+			authorizing_integration_owners: {},
+			entitlements: [],
+			attachment_size_limit: 26214400,
+			locale: Locale.Japanese,
+			channel: { id: '111', type: 0 },
+			channel_id: '111',
+			data: {
+				id: '200',
+				name: 'panel',
+				type: ApplicationCommandType.ChatInput,
+			},
+		} satisfies APIChatInputApplicationCommandInteraction;
+
+		const res = await app.fetch(createInteractionRequest(interaction), env, ctx);
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			type: InteractionResponseType.ChannelMessageWithSource,
+			data: {
+				content: 'このチャンネルでは使用できません。',
+				flags: MessageFlags.Ephemeral,
+			},
+		});
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it('opens the modal when the button is clicked', async () => {
@@ -196,11 +235,11 @@ describe('anonymous transporter bot', () => {
 			entitlements: [],
 			attachment_size_limit: 26214400,
 			locale: Locale.Japanese,
-			channel: { id: '111', type: 0 },
-			channel_id: '111',
+			channel: { id: env.TARGET_CHANNEL_ID, type: 0 },
+			channel_id: env.TARGET_CHANNEL_ID,
 			message: {
 				id: '300',
-				channel_id: '111',
+				channel_id: env.TARGET_CHANNEL_ID,
 				author: {
 					id: env.DISCORD_APPLICATION_ID,
 					username: 'bot',
@@ -360,15 +399,9 @@ describe('anonymous transporter bot', () => {
 	it('notifies user when TARGET_CHANNEL_ID is missing', async () => {
 		const app = createTestApp();
 		const { env } = createTestEnv();
-		const { ctx, flush } = createExecutionContext();
+		const { ctx } = createExecutionContext();
 
-		const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-			new Response(JSON.stringify({ id: '999' }), {
-				status: 200,
-				headers: { 'content-type': 'application/json' },
-			}),
-		);
-		const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const fetchMock = vi.spyOn(globalThis, 'fetch');
 
 		const interaction = {
 			id: '103',
@@ -398,15 +431,15 @@ describe('anonymous transporter bot', () => {
 			},
 		} satisfies APIModalSubmitInteraction;
 
-		await app.fetch(createInteractionRequest(interaction), { ...env, TARGET_CHANNEL_ID: '' }, ctx);
-		await flush();
-
-		expect(consoleErrorSpy).toHaveBeenCalled();
-		expect(fetchMock).toHaveBeenCalledTimes(1);
-		const [followupUrl, followupInit] = fetchMock.mock.calls[0]!;
-		expect(followupUrl).toContain('/messages/@original');
-		expect(JSON.parse(String(followupInit?.body))).toMatchObject({
-			content: '送信先チャンネルが設定されていません。管理者に連絡してください。',
+		const res = await app.fetch(createInteractionRequest(interaction), { ...env, TARGET_CHANNEL_ID: '' }, ctx);
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			type: InteractionResponseType.ChannelMessageWithSource,
+			data: {
+				content: '送信先チャンネルが設定されていません。管理者に連絡してください。',
+				flags: MessageFlags.Ephemeral,
+			},
 		});
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });

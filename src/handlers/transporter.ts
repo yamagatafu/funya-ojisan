@@ -70,19 +70,21 @@ async function postAndReplacePanelMessage(params: {
 }
 
 export const panelCommand = factory.command(makeSlashCommand('panel', '匿名メッセージ送信ボタンを表示します'), (c) => {
-	const channelId = c.interaction.channel_id;
+	const targetChannelId = c.env.TARGET_CHANNEL_ID?.trim();
+	if (!targetChannelId) {
+		return c.flags('EPHEMERAL').res('送信先チャンネルが設定されていません。管理者に連絡してください。');
+	}
+
+	if (c.interaction.channel_id !== targetChannelId) {
+		return c.flags('EPHEMERAL').res('このチャンネルでは使用できません。');
+	}
 
 	return c.flags('EPHEMERAL').resDefer(async (deferred) => {
-		if (!channelId) {
-			await deferred.followup('実行元チャンネルを取得できませんでした。');
-			return;
-		}
-
 		try {
 			const posted = await postAndReplacePanelMessage({
 				rest: deferred.rest,
 				kv: deferred.env.PANEL_KV,
-				channelId,
+				channelId: targetChannelId,
 			});
 
 			if (!posted) {
@@ -99,21 +101,31 @@ export const panelCommand = factory.command(makeSlashCommand('panel', '匿名メ
 });
 
 export const openModalComponent = factory.component(openModalButton, (c) => {
+	const targetChannelId = c.env.TARGET_CHANNEL_ID?.trim();
+	if (!targetChannelId) {
+		return c.flags('EPHEMERAL').res('送信先チャンネルが設定されていません。管理者に連絡してください。');
+	}
+
+	if (c.interaction.channel_id !== targetChannelId) {
+		return c.flags('EPHEMERAL').res('このチャンネルでは使用できません。');
+	}
+
 	return c.resModal(anonymousModal);
 });
 
 export const submitAnonymousModal = factory.modal(anonymousModal, (c) => {
-	const content = c.var[INPUT_ID]?.trim();
 	const targetChannelId = c.env.TARGET_CHANNEL_ID?.trim();
-	const panelChannelId = c.interaction.channel_id ?? targetChannelId;
+	if (!targetChannelId) {
+		return c.flags('EPHEMERAL').res('送信先チャンネルが設定されていません。管理者に連絡してください。');
+	}
+
+	if (c.interaction.channel_id !== targetChannelId) {
+		return c.flags('EPHEMERAL').res('このチャンネルでは使用できません。');
+	}
+
+	const content = c.var[INPUT_ID]?.trim();
 
 	return c.flags('EPHEMERAL').resDefer(async (deferred) => {
-		if (!targetChannelId) {
-			console.error('TARGET_CHANNEL_ID is not configured.');
-			await deferred.followup('送信先チャンネルが設定されていません。管理者に連絡してください。');
-			return;
-		}
-
 		if (!content) {
 			await deferred.followup('送信内容が空のため送信できませんでした。');
 			return;
@@ -132,13 +144,11 @@ export const submitAnonymousModal = factory.modal(anonymousModal, (c) => {
 				return;
 			}
 
-			if (panelChannelId) {
-				await postAndReplacePanelMessage({
-					rest: deferred.rest,
-					kv: deferred.env.PANEL_KV,
-					channelId: panelChannelId,
-				});
-			}
+			await postAndReplacePanelMessage({
+				rest: deferred.rest,
+				kv: deferred.env.PANEL_KV,
+				channelId: targetChannelId,
+			});
 
 			await deferred.followup('メッセージを送信しました。');
 		} catch (error) {
