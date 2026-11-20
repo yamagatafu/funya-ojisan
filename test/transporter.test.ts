@@ -593,7 +593,91 @@ describe('anonymous transporter bot', () => {
 		});
 	});
 
-	it('notifies accurately when forwarding succeeds but KV put throws after retries', async () => {
+	it('falls back to backup KV key when primary kv.put fails 3 times, and cleans up on next invocation', async () => {
+		vi.useFakeTimers();
+		const app = createTestApp();
+		const { env, kv, store } = createTestEnv();
+		const { ctx, flush } = createExecutionContext();
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		let failPrimary = true;
+		vi.spyOn(kv, 'put').mockImplementation(async (key, value) => {
+			if (failPrimary && key === `panel_message:${TARGET_CHANNEL_ID}`) {
+				throw new Error('429 Too Many Requests');
+			}
+			store.set(key, value);
+		});
+
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'forwarded-msg-1' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'backup-tracked-panel-1' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const modalInteraction = createModalInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+			value: 'バックアップテスト',
+		});
+
+		await app.fetch(createInteractionRequest(modalInteraction), env, ctx);
+		const flush1 = flush();
+		await vi.runAllTimersAsync();
+		await flush1;
+
+		expect(JSON.parse(store.get(`panel_backup:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
+			currentId: 'backup-tracked-panel-1',
+			pendingDeleteIds: [],
+		});
+		const [, followup1Init] = fetchMock.mock.calls[2]!;
+		expect(JSON.parse(String(followup1Init?.body))).toMatchObject({
+			content: 'メッセージを送信しました。',
+		});
+
+		failPrimary = false;
+		fetchMock.mockClear();
+		fetchMock
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'next-panel-2' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(new Response(null, { status: 204 }))
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const panelInteraction = createPanelCommandInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+		});
+
+		await app.fetch(createInteractionRequest(panelInteraction), env, ctx);
+		const flush2 = flush();
+		await vi.runAllTimersAsync();
+		await flush2;
+
+		expect(fetchMock.mock.calls[1]?.[0]).toBe(
+			`https://discord.com/api/v10/channels/${TARGET_CHANNEL_ID}/messages/backup-tracked-panel-1`,
+		);
+		expect(fetchMock.mock.calls[1]?.[1]?.method).toBe('DELETE');
+		expect(store.get(`panel_backup:${TARGET_CHANNEL_ID}`)).toBe('');
+		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
+			currentId: 'next-panel-2',
+			pendingDeleteIds: [],
+		});
+	});
+
+	it('rolls back posted panel and notifies accurately when both primary and backup KV puts fail', async () => {
 		vi.useFakeTimers();
 		const app = createTestApp();
 		const { env, kv } = createTestEnv();
@@ -615,6 +699,7 @@ describe('anonymous transporter bot', () => {
 					headers: { 'content-type': 'application/json' },
 				}),
 			)
+			.mockResolvedValueOnce(new Response(null, { status: 204 }))
 			.mockResolvedValue(new Response(null, { status: 200 }));
 
 		const interaction = createModalInteraction({
@@ -628,8 +713,12 @@ describe('anonymous transporter bot', () => {
 		await vi.runAllTimersAsync();
 		await flushPromise;
 
-		expect(putMock).toHaveBeenCalledTimes(3);
-		const [, followupInit] = fetchMock.mock.calls[2]!;
+		expect(putMock).toHaveBeenCalledTimes(4);
+		expect(fetchMock.mock.calls[2]?.[0]).toBe(
+			`https://discord.com/api/v10/channels/${TARGET_CHANNEL_ID}/messages/new-panel-msg-2`,
+		);
+		expect(fetchMock.mock.calls[2]?.[1]?.method).toBe('DELETE');
+		const [, followupInit] = fetchMock.mock.calls[3]!;
 		expect(JSON.parse(String(followupInit?.body))).toMatchObject({
 			content: 'メッセージは送信しましたが、送信パネルの更新に失敗しました。',
 		});

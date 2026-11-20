@@ -18,6 +18,7 @@ const BUTTON_ID = 'open_anonymous_modal';
 const MODAL_ID = 'anonymous_modal';
 const INPUT_ID = 'message_content';
 const PANEL_KV_KEY_PREFIX = 'panel_message:';
+const PANEL_BACKUP_KV_KEY_PREFIX = 'panel_backup:';
 const MAX_PENDING_DELETE_IDS = 10;
 const KV_PUT_MAX_ATTEMPTS = 3;
 const KV_PUT_BASE_DELAY_MS = 1000;
@@ -141,7 +142,10 @@ async function postAndReplacePanelMessage(params: {
 }): Promise<boolean> {
 	const { rest, kv, channelId } = params;
 	const kvKey = `${PANEL_KV_KEY_PREFIX}${channelId}`;
-	const state = parsePanelState(await kv.get(kvKey));
+	const backupKey = `${PANEL_BACKUP_KV_KEY_PREFIX}${channelId}`;
+	const [primaryRaw, backupRaw] = await Promise.all([kv.get(kvKey), kv.get(backupKey)]);
+	const primaryState = parsePanelState(primaryRaw);
+	const backupState = parsePanelState(backupRaw);
 
 	const postResponse = await rest('POST', $channels$_$messages, [channelId], panelMessagePayload);
 	if (!postResponse.ok) {
@@ -158,7 +162,12 @@ async function postAndReplacePanelMessage(params: {
 	}
 
 	const deleteTargets = Array.from(
-		new Set([...(state.currentId ? [state.currentId] : []), ...state.pendingDeleteIds]),
+		new Set([
+			...(primaryState.currentId ? [primaryState.currentId] : []),
+			...primaryState.pendingDeleteIds,
+			...(backupState.currentId ? [backupState.currentId] : []),
+			...backupState.pendingDeleteIds,
+		]),
 	).filter((id) => id !== newMessageId);
 
 	const remainingPendingIds: string[] = [];
@@ -180,9 +189,33 @@ async function postAndReplacePanelMessage(params: {
 		currentId: newMessageId,
 		pendingDeleteIds: remainingPendingIds.slice(-MAX_PENDING_DELETE_IDS),
 	} satisfies PanelState;
+	const serializedState = JSON.stringify(nextState);
 
-	await putWithBackoff(kv, kvKey, JSON.stringify(nextState));
-	return true;
+	try {
+		await putWithBackoff(kv, kvKey, serializedState);
+		if (backupRaw) {
+			try {
+				await kv.put(backupKey, '');
+			} catch (clearError) {
+				console.error('Failed to clear backup KV key:', clearError);
+			}
+		}
+		return true;
+	} catch (primaryPutError) {
+		console.error('Failed to persist panel state to primary KV key after retries:', primaryPutError);
+		try {
+			await kv.put(backupKey, serializedState);
+			return true;
+		} catch (backupPutError) {
+			console.error('Failed to persist panel state to backup KV key; rolling back posted panel:', backupPutError);
+			try {
+				await rest('DELETE', $channels$_$messages$_, [channelId, newMessageId]);
+			} catch (rollbackError) {
+				console.error('Failed to roll back posted panel message:', newMessageId, rollbackError);
+			}
+			throw backupPutError;
+		}
+	}
 }
 
 export const panelCommand = factory.command(
