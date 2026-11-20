@@ -24,6 +24,8 @@ const KV_PUT_BASE_DELAY_MS = 1000;
 const DELETE_ROLLBACK_MAX_ATTEMPTS = 3;
 const DELETE_ROLLBACK_BASE_DELAY_MS = 1000;
 const MAX_RETRY_AFTER_MS = 20_000;
+const WORKER_EXECUTION_BUDGET_MS = 25_000;
+const KV_SAME_KEY_MIN_INTERVAL_MS = 1000;
 
 const openModalButton = makeButton(BUTTON_ID, '匿名メッセージを送る', buttonStyle.Primary);
 
@@ -179,8 +181,9 @@ async function deletePanelMessageWithRetry(params: {
 	rest: RestClient;
 	channelId: string;
 	messageId: string;
+	deadlineMs: number;
 }): Promise<boolean> {
-	const { rest, channelId, messageId } = params;
+	const { rest, channelId, messageId, deadlineMs } = params;
 
 	for (let attempt = 1; attempt <= DELETE_ROLLBACK_MAX_ATTEMPTS; attempt++) {
 		let delayMs = DELETE_ROLLBACK_BASE_DELAY_MS * attempt;
@@ -194,13 +197,14 @@ async function deletePanelMessageWithRetry(params: {
 			if (response.status === 429) {
 				const retryAfterMs = await extractRetryAfterMs(response);
 				if (retryAfterMs !== null) {
-					if (retryAfterMs > MAX_RETRY_AFTER_MS) {
-						console.error(
-							`[ALERT] Rollback DELETE rate limited beyond worker budget (${retryAfterMs}ms > ${MAX_RETRY_AFTER_MS}ms): channelId=${channelId}, messageId=${messageId}`,
-						);
-						break;
-					}
 					delayMs = retryAfterMs;
+				}
+				const remainingBudgetMs = deadlineMs - Date.now();
+				if (delayMs > MAX_RETRY_AFTER_MS || delayMs >= remainingBudgetMs) {
+					console.error(
+						`[ALERT] Rollback DELETE rate limited beyond worker budget (${delayMs}ms, remaining=${remainingBudgetMs}ms): channelId=${channelId}, messageId=${messageId}`,
+					);
+					break;
 				}
 				console.error(
 					`[ALERT] Rollback DELETE rate limited (attempt ${attempt}/${DELETE_ROLLBACK_MAX_ATTEMPTS}, wait ${delayMs}ms): channelId=${channelId}, messageId=${messageId}`,
@@ -219,6 +223,12 @@ async function deletePanelMessageWithRetry(params: {
 		}
 
 		if (attempt < DELETE_ROLLBACK_MAX_ATTEMPTS) {
+			if (Date.now() + delayMs >= deadlineMs) {
+				console.error(
+					`[ALERT] Rollback DELETE retry skipped due to insufficient remaining worker budget: channelId=${channelId}, messageId=${messageId}`,
+				);
+				break;
+			}
 			await new Promise((resolve) => setTimeout(resolve, delayMs));
 		}
 	}
@@ -233,8 +243,10 @@ async function postAndReplacePanelMessage(params: {
 	rest: RestClient;
 	kv: PanelKvStore;
 	channelId: string;
+	deadlineMs?: number;
 }): Promise<boolean> {
 	const { rest, kv, channelId } = params;
+	const deadlineMs = params.deadlineMs ?? Date.now() + WORKER_EXECUTION_BUDGET_MS;
 	const kvKey = `${PANEL_KV_KEY_PREFIX}${channelId}`;
 	const backupKey = `${PANEL_BACKUP_KV_KEY_PREFIX}${channelId}`;
 	const [primaryRaw, backupRaw] = await Promise.all([kv.get(kvKey), kv.get(backupKey)]);
@@ -270,19 +282,23 @@ async function postAndReplacePanelMessage(params: {
 	} satisfies PanelState;
 
 	let persistedKey: 'primary' | 'backup' = 'primary';
+	let initialPutAt = 0;
 	try {
 		await putWithBackoff(kv, kvKey, JSON.stringify(initialState));
+		initialPutAt = Date.now();
 	} catch (primaryPutError) {
 		console.error('Failed to persist panel state to primary KV key after retries:', primaryPutError);
 		try {
 			await kv.put(backupKey, JSON.stringify(initialState));
 			persistedKey = 'backup';
+			initialPutAt = Date.now();
 		} catch (backupPutError) {
 			console.error('Failed to persist panel state to backup KV key; rolling back posted panel:', backupPutError);
 			const rolledBack = await deletePanelMessageWithRetry({
 				rest,
 				channelId,
 				messageId: newMessageId,
+				deadlineMs,
 			});
 			if (!rolledBack) {
 				throw new PanelRollbackFailedError(channelId, newMessageId);
@@ -292,9 +308,18 @@ async function postAndReplacePanelMessage(params: {
 	}
 
 	const remainingPendingIds: string[] = [];
-	for (const targetId of deleteTargets) {
+	for (let i = 0; i < deleteTargets.length; i++) {
+		const targetId = deleteTargets[i]!;
 		try {
 			const deleteResponse = await rest('DELETE', $channels$_$messages$_, [channelId, targetId]);
+			if (deleteResponse.status === 429) {
+				console.error(
+					'Rate limited while deleting previous panel message; deferring remaining deletions:',
+					targetId,
+				);
+				remainingPendingIds.push(...deleteTargets.slice(i));
+				break;
+			}
 			if (!deleteResponse.ok && deleteResponse.status !== 404) {
 				const errorText = await deleteResponse.text();
 				console.error('Failed to delete previous panel message:', targetId, deleteResponse.status, errorText);
@@ -316,6 +341,11 @@ async function postAndReplacePanelMessage(params: {
 		} satisfies PanelState;
 		const serializedFinalized = JSON.stringify(finalizedState);
 		const targetKey = persistedKey === 'primary' ? kvKey : backupKey;
+
+		const elapsedSinceInitialPut = Date.now() - initialPutAt;
+		if (elapsedSinceInitialPut < KV_SAME_KEY_MIN_INTERVAL_MS) {
+			await new Promise((resolve) => setTimeout(resolve, KV_SAME_KEY_MIN_INTERVAL_MS - elapsedSinceInitialPut));
+		}
 
 		try {
 			await putWithBackoff(kv, targetKey, serializedFinalized);
@@ -407,6 +437,7 @@ export const submitAnonymousModal = factory.modal(anonymousModal, (c) => {
 	}
 
 	return c.flags('EPHEMERAL').resDefer(async (deferred) => {
+		const deadlineMs = Date.now() + WORKER_EXECUTION_BUDGET_MS;
 		try {
 			const response = await deferred.rest('POST', $channels$_$messages, [validation.targetChannelId], {
 				content,
@@ -430,6 +461,7 @@ export const submitAnonymousModal = factory.modal(anonymousModal, (c) => {
 				rest: deferred.rest,
 				kv: validation.kv,
 				channelId: validation.targetChannelId,
+				deadlineMs,
 			});
 
 			if (!replaced) {

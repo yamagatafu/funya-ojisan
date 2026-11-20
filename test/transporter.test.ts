@@ -895,8 +895,9 @@ describe('anonymous transporter bot', () => {
 
 		await app.fetch(createInteractionRequest(interaction), env, ctx);
 		const flushPromise = flush();
-		await vi.runAllTimersAsync();
-		await flushPromise;
+
+		// KV リトライ分の 3,000ms だけ進め、25秒待機せずに即座にアラートが出ることを検証
+		await vi.advanceTimersByTimeAsync(3000);
 
 		const deleteCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE');
 		expect(deleteCalls).toHaveLength(1);
@@ -910,6 +911,50 @@ describe('anonymous transporter bot', () => {
 				args[0].includes('untracked-panel-budget'),
 		);
 		expect(alertCall).toBeDefined();
+
+		await flushPromise;
+	});
+
+	it('defers remaining old-panel deletions when DELETE returns 429', async () => {
+		vi.useFakeTimers();
+		const app = createTestApp();
+		const { env, store } = createTestEnv({
+			[`panel_message:${TARGET_CHANNEL_ID}`]: JSON.stringify({
+				currentId: 'old-1',
+				pendingDeleteIds: ['old-2', 'old-3'],
+			}),
+		});
+		const { ctx, flush } = createExecutionContext();
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'new-panel-4' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(new Response(null, { status: 204 }))
+			.mockResolvedValueOnce(new Response('Rate Limited', { status: 429 }))
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const interaction = createPanelCommandInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		const flushPromise = flush();
+		await vi.runAllTimersAsync();
+		await flushPromise;
+
+		const deleteCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE');
+		expect(deleteCalls).toHaveLength(2);
+		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
+			currentId: 'new-panel-4',
+			pendingDeleteIds: ['old-2', 'old-3'],
+		});
 	});
 
 	it('alerts with channelId and messageId when rollback DELETE fails 3 times with 500', async () => {
