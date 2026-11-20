@@ -4,9 +4,9 @@
 
 ## 機能
 
-- `/panel`: 匿名メッセージ送信用のボタン付きメッセージを `TARGET_CHANNEL_ID` に投稿し、メッセージ ID を KV (`PANEL_KV`) に保存します。すでに前回のボタンメッセージがある場合は削除します（`MANAGE_MESSAGES` 権限が必要）。
+- `/panel`: 匿名メッセージ送信用のボタン付きメッセージを `TARGET_CHANNEL_ID` に投稿し、メッセージ ID を KV (`PANEL_KV`) に保存したうえで前回のボタンメッセージを削除します（`MANAGE_MESSAGES` 権限が必要）。
 - ボタン押下 (`open_anonymous_modal`): 入力用のモーダルを表示します。
-- モーダル送信 (`anonymous_modal`): 入力内容を Discord REST API (`POST /channels/{channel.id}/messages`) 経由で `TARGET_CHANNEL_ID` に転送します（Webhook 不使用）。転送完了後、前回のボタンメッセージを削除し、新しいボタンメッセージを投稿して KV を更新します。
+- モーダル送信 (`anonymous_modal`): 入力内容を Discord REST API (`POST /channels/{channel.id}/messages`) 経由で `TARGET_CHANNEL_ID` に転送します（Webhook 不使用）。転送完了後、新しいボタンメッセージを投稿して KV に保存したうえで、前回のボタンメッセージを削除します。
 - `TARGET_CHANNEL_ID` 以外のチャンネルからのコマンド・ボタン・モーダル操作は無視（Ephemeral 応答）します。
 
 > [!NOTE]
@@ -51,6 +51,10 @@ pnpm dev
 ### 5. デプロイ (Cloudflare Workers)
 
 本番環境用のシークレットを設定し、`wrangler.jsonc` の `vars.TARGET_CHANNEL_ID` と `kv_namespaces`（バインディング名 `PANEL_KV`）を確認したうえでデプロイします。
+
+> [!IMPORTANT]
+> すでに本番環境に `wrangler secret put TARGET_CHANNEL_ID` でシークレットを登録している場合、`wrangler.jsonc` の `vars.TARGET_CHANNEL_ID` と名前が衝突して `wrangler deploy` が失敗します。移行時は事前に `pnpm exec wrangler secret delete TARGET_CHANNEL_ID` を実行してください。
+> また、`wrangler.jsonc` の `previews` ブロックでは Preview URL を Discord の Interactions Endpoint URL として登録しない前提で本番と同じ `TARGET_CHANNEL_ID` / `PANEL_KV` ID を指定しています。プレビュー環境で実動作テストを行う場合は、専用チャンネルと専用 KV Namespace に分離してください。
 
 ```bash
 pnpm exec wrangler secret put DISCORD_APPLICATION_ID

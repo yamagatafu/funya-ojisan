@@ -123,7 +123,7 @@ function validateChannelAndEnv(params: {
 	return { ok: true, targetChannelId, kv: params.env.PANEL_KV };
 }
 
-async function putWithBackoff(kv: PanelKvStore, key: string, value: string): Promise<void> {
+async function putWithBackoff(kv: PanelKvStore, key: string, value: string, deadlineMs?: number): Promise<void> {
 	let lastError: unknown;
 	for (let attempt = 1; attempt <= KV_PUT_MAX_ATTEMPTS; attempt++) {
 		try {
@@ -132,7 +132,11 @@ async function putWithBackoff(kv: PanelKvStore, key: string, value: string): Pro
 		} catch (error) {
 			lastError = error;
 			if (attempt < KV_PUT_MAX_ATTEMPTS) {
-				await new Promise((resolve) => setTimeout(resolve, KV_PUT_BASE_DELAY_MS * attempt));
+				const delayMs = KV_PUT_BASE_DELAY_MS * attempt;
+				if (deadlineMs !== undefined && Date.now() + delayMs >= deadlineMs) {
+					break;
+				}
+				await new Promise((resolve) => setTimeout(resolve, delayMs));
 			}
 		}
 	}
@@ -284,7 +288,7 @@ async function postAndReplacePanelMessage(params: {
 	let persistedKey: 'primary' | 'backup' = 'primary';
 	let initialPutAt = 0;
 	try {
-		await putWithBackoff(kv, kvKey, JSON.stringify(initialState));
+		await putWithBackoff(kv, kvKey, JSON.stringify(initialState), deadlineMs);
 		initialPutAt = Date.now();
 	} catch (primaryPutError) {
 		console.error('Failed to persist panel state to primary KV key after retries:', primaryPutError);
@@ -310,6 +314,13 @@ async function postAndReplacePanelMessage(params: {
 	const remainingPendingIds: string[] = [];
 	for (let i = 0; i < deleteTargets.length; i++) {
 		const targetId = deleteTargets[i]!;
+		if (Date.now() >= deadlineMs) {
+			console.error(
+				`Worker execution budget reached during panel cleanup; deferring remaining deletions: count=${deleteTargets.length - i}`,
+			);
+			remainingPendingIds.push(...deleteTargets.slice(i));
+			break;
+		}
 		try {
 			const deleteResponse = await rest('DELETE', $channels$_$messages$_, [channelId, targetId]);
 			if (deleteResponse.status === 429) {
@@ -322,8 +333,19 @@ async function postAndReplacePanelMessage(params: {
 			}
 			if (!deleteResponse.ok && deleteResponse.status !== 404) {
 				const errorText = await deleteResponse.text();
-				console.error('Failed to delete previous panel message:', targetId, deleteResponse.status, errorText);
-				remainingPendingIds.push(targetId);
+				if (deleteResponse.status >= 400 && deleteResponse.status < 500) {
+					console.error(
+						`[ALERT] Unrecoverable 4xx error while deleting panel message (dropping from pending): channelId=${channelId}, messageId=${targetId}, status=${deleteResponse.status}, body=${errorText}`,
+					);
+				} else {
+					console.error(
+						'Failed to delete previous panel message:',
+						targetId,
+						deleteResponse.status,
+						errorText,
+					);
+					remainingPendingIds.push(targetId);
+				}
 			}
 		} catch (error) {
 			console.error('Unexpected error while deleting previous panel message:', targetId, error);
@@ -343,20 +365,29 @@ async function postAndReplacePanelMessage(params: {
 		const targetKey = persistedKey === 'primary' ? kvKey : backupKey;
 
 		const elapsedSinceInitialPut = Date.now() - initialPutAt;
-		if (elapsedSinceInitialPut < KV_SAME_KEY_MIN_INTERVAL_MS) {
-			await new Promise((resolve) => setTimeout(resolve, KV_SAME_KEY_MIN_INTERVAL_MS - elapsedSinceInitialPut));
-		}
+		const minIntervalWaitMs =
+			elapsedSinceInitialPut < KV_SAME_KEY_MIN_INTERVAL_MS
+				? KV_SAME_KEY_MIN_INTERVAL_MS - elapsedSinceInitialPut
+				: 0;
 
-		try {
-			await putWithBackoff(kv, targetKey, serializedFinalized);
-		} catch (finalizeError) {
-			console.error('Failed to update cleaned-up pendingDeleteIds in KV:', finalizeError);
+		if (Date.now() + minIntervalWaitMs < deadlineMs) {
+			if (minIntervalWaitMs > 0) {
+				await new Promise((resolve) => setTimeout(resolve, minIntervalWaitMs));
+			}
+
+			try {
+				await putWithBackoff(kv, targetKey, serializedFinalized, deadlineMs);
+			} catch (finalizeError) {
+				console.error('Failed to update cleaned-up pendingDeleteIds in KV:', finalizeError);
+			}
+		} else {
+			console.error('Skipping finalized KV update due to insufficient remaining worker budget.');
 		}
 	}
 
 	if (needsBackupClear) {
 		try {
-			await kv.put(backupKey, '');
+			await kv.delete(backupKey);
 		} catch (clearError) {
 			console.error('Failed to clear backup KV key:', clearError);
 		}

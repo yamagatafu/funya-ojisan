@@ -27,6 +27,9 @@ function createMockKV(initialEntries: Record<string, string> = {}) {
 		put: vi.fn(async (key: string, value: string) => {
 			store.set(key, value);
 		}),
+		delete: vi.fn(async (key: string) => {
+			store.delete(key);
+		}),
 	} satisfies PanelKvStore;
 
 	return { kv, store };
@@ -740,7 +743,7 @@ describe('anonymous transporter bot', () => {
 			`https://discord.com/api/v10/channels/${TARGET_CHANNEL_ID}/messages/backup-tracked-panel-1`,
 		);
 		expect(fetchMock.mock.calls[1]?.[1]?.method).toBe('DELETE');
-		expect(store.get(`panel_backup:${TARGET_CHANNEL_ID}`)).toBe('');
+		expect(store.has(`panel_backup:${TARGET_CHANNEL_ID}`)).toBe(false);
 		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
 			currentId: 'next-panel-2',
 			pendingDeleteIds: [],
@@ -954,6 +957,97 @@ describe('anonymous transporter bot', () => {
 		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
 			currentId: 'new-panel-4',
 			pendingDeleteIds: ['old-2', 'old-3'],
+		});
+	});
+
+	it('alerts and drops unrecoverable 4xx (non-404/429) ids from pendingDeleteIds', async () => {
+		vi.useFakeTimers();
+		const app = createTestApp();
+		const { env, store } = createTestEnv({
+			[`panel_message:${TARGET_CHANNEL_ID}`]: JSON.stringify({
+				currentId: 'forbidden-old-1',
+				pendingDeleteIds: ['server-err-2'],
+			}),
+		});
+		const { ctx, flush } = createExecutionContext();
+		const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		vi.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'new-panel-3' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(new Response('Missing Permissions', { status: 403 }))
+			.mockResolvedValueOnce(new Response('Server Error', { status: 500 }))
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const interaction = createPanelCommandInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		const flushPromise = flush();
+		await vi.runAllTimersAsync();
+		await flushPromise;
+
+		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
+			currentId: 'new-panel-3',
+			pendingDeleteIds: ['server-err-2'],
+		});
+		const alertCall = consoleErrorSpy.mock.calls.find(
+			(args) =>
+				typeof args[0] === 'string' &&
+				args[0].includes('[ALERT]') &&
+				args[0].includes('4xx') &&
+				args[0].includes('forbidden-old-1'),
+		);
+		expect(alertCall).toBeDefined();
+	});
+
+	it('defers remaining deletions when worker deadline is reached during cleanup loop', async () => {
+		vi.useFakeTimers();
+		const app = createTestApp();
+		const { env, store } = createTestEnv({
+			[`panel_message:${TARGET_CHANNEL_ID}`]: JSON.stringify({
+				currentId: 'old-1',
+				pendingDeleteIds: ['old-2', 'old-3'],
+			}),
+		});
+		const { ctx, flush } = createExecutionContext();
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'new-panel-4' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockImplementationOnce(async () => {
+				vi.advanceTimersByTime(26_000);
+				return new Response(null, { status: 204 });
+			})
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const interaction = createPanelCommandInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		const flushPromise = flush();
+		await vi.runAllTimersAsync();
+		await flushPromise;
+
+		const deleteCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE');
+		expect(deleteCalls).toHaveLength(1);
+		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
+			currentId: 'new-panel-4',
+			pendingDeleteIds: ['old-1', 'old-2', 'old-3'],
 		});
 	});
 
