@@ -4,6 +4,12 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2026-01-01",
 	"vars": {
-		"TARGET_CHANNEL_ID": ""
-	}
+		"TARGET_CHANNEL_ID": "1572996233553907744"
+	},
+	"kv_namespaces": [
+		{
+			"binding": "PANEL_KV",
+			"id": "098cee9f95ca4145833bef86c49e4f97"
+		}
+	]
 }

@@ -1,5 +1,6 @@
 import {
 	$channels$_$messages,
+	$channels$_$messages$_,
 	buttonStyle,
 	makeActionRow,
 	makeButton,
@@ -9,12 +10,19 @@ import {
 	textInputStyle,
 } from 'discord-hono';
 import { factory } from '../factory.ts';
+import type { PanelKvStore } from '../types.ts';
 
 const BUTTON_ID = 'open_anonymous_modal';
 const MODAL_ID = 'anonymous_modal';
 const INPUT_ID = 'message_content';
+const PANEL_KV_KEY_PREFIX = 'panel_message:';
 
 const openModalButton = makeButton(BUTTON_ID, '匿名メッセージを送る', buttonStyle.Primary);
+
+const panelMessagePayload = {
+	content: '下のボタンから匿名メッセージを送信できます。',
+	components: [makeActionRow([openModalButton])],
+};
 
 const anonymousModal = makeModal(MODAL_ID, '匿名メッセージ送信', [
 	makeActionRow([
@@ -26,10 +34,67 @@ const anonymousModal = makeModal(MODAL_ID, '匿名メッセージ送信', [
 	]),
 ]);
 
+type RestClient = Parameters<Parameters<typeof factory.command>[1]>[0]['rest'];
+
+async function postAndReplacePanelMessage(params: {
+	rest: RestClient;
+	kv: PanelKvStore | undefined;
+	channelId: string;
+}): Promise<boolean> {
+	const { rest, kv, channelId } = params;
+	const kvKey = `${PANEL_KV_KEY_PREFIX}${channelId}`;
+	const oldMessageId = kv ? await kv.get(kvKey) : null;
+
+	const postResponse = await rest('POST', $channels$_$messages, [channelId], panelMessagePayload);
+	if (!postResponse.ok) {
+		const errorText = await postResponse.text();
+		console.error('Failed to post panel message:', postResponse.status, errorText);
+		return false;
+	}
+
+	const postedMessage = await postResponse.json();
+
+	if (oldMessageId && oldMessageId !== postedMessage.id) {
+		const deleteResponse = await rest('DELETE', $channels$_$messages$_, [channelId, oldMessageId]);
+		if (!deleteResponse.ok && deleteResponse.status !== 404) {
+			const errorText = await deleteResponse.text();
+			console.error('Failed to delete previous panel message:', deleteResponse.status, errorText);
+		}
+	}
+
+	if (kv) {
+		await kv.put(kvKey, postedMessage.id);
+	}
+
+	return true;
+}
+
 export const panelCommand = factory.command(makeSlashCommand('panel', '匿名メッセージ送信ボタンを表示します'), (c) => {
-	return c.res({
-		content: '下のボタンから匿名メッセージを送信できます。',
-		components: [makeActionRow([openModalButton])],
+	const channelId = c.interaction.channel_id;
+
+	return c.flags('EPHEMERAL').resDefer(async (deferred) => {
+		if (!channelId) {
+			await deferred.followup('実行元チャンネルを取得できませんでした。');
+			return;
+		}
+
+		try {
+			const posted = await postAndReplacePanelMessage({
+				rest: deferred.rest,
+				kv: deferred.env.PANEL_KV,
+				channelId,
+			});
+
+			if (!posted) {
+				await deferred.followup('送信パネルの投稿に失敗しました。');
+				return;
+			}
+
+			await deferred.followup('送信パネルを設置しました。');
+		} catch (error) {
+			console.error('Unexpected error while posting panel message:', error);
+			await deferred.followup('送信パネルの設置中にエラーが発生しました。');
+		}
 	});
 });
 
@@ -40,6 +105,7 @@ export const openModalComponent = factory.component(openModalButton, (c) => {
 export const submitAnonymousModal = factory.modal(anonymousModal, (c) => {
 	const content = c.var[INPUT_ID]?.trim();
 	const targetChannelId = c.env.TARGET_CHANNEL_ID?.trim();
+	const panelChannelId = c.interaction.channel_id ?? targetChannelId;
 
 	return c.flags('EPHEMERAL').resDefer(async (deferred) => {
 		if (!targetChannelId) {
@@ -64,6 +130,14 @@ export const submitAnonymousModal = factory.modal(anonymousModal, (c) => {
 				console.error('Failed to forward message:', response.status, errorText);
 				await deferred.followup('メッセージの転送に失敗しました。時間をおいて再度お試しください。');
 				return;
+			}
+
+			if (panelChannelId) {
+				await postAndReplacePanelMessage({
+					rest: deferred.rest,
+					kv: deferred.env.PANEL_KV,
+					channelId: panelChannelId,
+				});
 			}
 
 			await deferred.followup('メッセージを送信しました。');

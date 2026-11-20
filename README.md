@@ -4,9 +4,9 @@
 
 ## 機能
 
-- `/panel`: 匿名メッセージ送信用のボタン付きメッセージをチャンネルに投稿します。
+- `/panel`: 匿名メッセージ送信用のボタン付きメッセージをチャンネルに投稿し、メッセージ ID を KV (`PANEL_KV`) に保存します。すでに前回のボタンメッセージがある場合は削除します。
 - ボタン押下 (`open_anonymous_modal`): 入力用のモーダルを表示します。
-- モーダル送信 (`anonymous_modal`): 入力内容を Discord REST API (`POST /channels/{channel.id}/messages`) 経由で指定チャンネルに転送します（Webhook 不使用）。
+- モーダル送信 (`anonymous_modal`): 入力内容を Discord REST API (`POST /channels/{channel.id}/messages`) 経由で指定チャンネルに転送します（Webhook 不使用）。転送完了後、前回のボタンメッセージを削除し、新しいボタンメッセージを投稿して KV を更新します。
 
 ## セットアップ
 
@@ -31,6 +31,8 @@ cp .dev.vars.example .dev.vars
 | `DISCORD_TOKEN`          | Discord Bot トークン                                          |
 | `TARGET_CHANNEL_ID`      | 転送先チャンネル ID                                           |
 | `DISCORD_GUILD_ID`       | （任意）ギルド限定で即時にコマンド登録したい場合のサーバー ID |
+
+また、ボタンメッセージの自動差し替えを行うため、Cloudflare Workers の KV Namespace を作成し、バインディング名 `PANEL_KV` として紐付けてください（[wrangler.jsonc](wrangler.jsonc) のコメント参照）。
 
 ### 3. スラッシュコマンドの登録
 
