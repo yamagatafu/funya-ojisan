@@ -724,6 +724,103 @@ describe('anonymous transporter bot', () => {
 		});
 	});
 
+	it('retries rollback DELETE when Discord returns 429 and succeeds on retry', async () => {
+		vi.useFakeTimers();
+		const app = createTestApp();
+		const { env, kv } = createTestEnv();
+		const { ctx, flush } = createExecutionContext();
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.spyOn(kv, 'put').mockRejectedValue(new Error('429 Too Many Requests'));
+
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'forwarded-msg-1' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'rollback-target-1' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(new Response('Rate Limited', { status: 429 }))
+			.mockResolvedValueOnce(new Response(null, { status: 204 }))
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const interaction = createModalInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+			value: '429 ロールバックテスト',
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		const flushPromise = flush();
+		await vi.runAllTimersAsync();
+		await flushPromise;
+
+		const deleteCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE');
+		expect(deleteCalls).toHaveLength(2);
+		expect(deleteCalls[0]?.[0]).toBe(
+			`https://discord.com/api/v10/channels/${TARGET_CHANNEL_ID}/messages/rollback-target-1`,
+		);
+		const [, followupInit] = fetchMock.mock.calls[4]!;
+		expect(JSON.parse(String(followupInit?.body))).toMatchObject({
+			content: 'メッセージは送信しましたが、送信パネルの更新に失敗しました。',
+		});
+	});
+
+	it('alerts with channelId and messageId when rollback DELETE fails 3 times with 500', async () => {
+		vi.useFakeTimers();
+		const app = createTestApp();
+		const { env, kv } = createTestEnv();
+		const { ctx, flush } = createExecutionContext();
+		const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.spyOn(kv, 'put').mockRejectedValue(new Error('KV Down'));
+
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'untracked-panel-99' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(new Response('Server Error', { status: 500 }))
+			.mockResolvedValueOnce(new Response('Server Error', { status: 500 }))
+			.mockResolvedValueOnce(new Response('Server Error', { status: 500 }))
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const interaction = createPanelCommandInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		const flushPromise = flush();
+		await vi.runAllTimersAsync();
+		await flushPromise;
+
+		const deleteCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE');
+		expect(deleteCalls).toHaveLength(3);
+
+		const alertCall = consoleErrorSpy.mock.calls.find(
+			(args) =>
+				typeof args[0] === 'string' &&
+				args[0].includes('[ALERT]') &&
+				args[0].includes(TARGET_CHANNEL_ID) &&
+				args[0].includes('untracked-panel-99'),
+		);
+		expect(alertCall).toBeDefined();
+
+		const [, followupInit] = fetchMock.mock.calls[4]!;
+		const followupBody = JSON.parse(String(followupInit?.body));
+		expect(followupBody.content).toContain(TARGET_CHANNEL_ID);
+		expect(followupBody.content).toContain('untracked-panel-99');
+	});
+
 	it('does not update panel when message forwarding returns 500', async () => {
 		const app = createTestApp();
 		const { env, kv } = createTestEnv();

@@ -22,6 +22,8 @@ const PANEL_BACKUP_KV_KEY_PREFIX = 'panel_backup:';
 const MAX_PENDING_DELETE_IDS = 10;
 const KV_PUT_MAX_ATTEMPTS = 3;
 const KV_PUT_BASE_DELAY_MS = 1000;
+const DELETE_ROLLBACK_MAX_ATTEMPTS = 3;
+const DELETE_ROLLBACK_BASE_DELAY_MS = 1000;
 
 const openModalButton = makeButton(BUTTON_ID, '匿名メッセージを送る', buttonStyle.Primary);
 
@@ -135,6 +137,55 @@ async function putWithBackoff(kv: PanelKvStore, key: string, value: string): Pro
 	throw lastError;
 }
 
+class PanelRollbackFailedError extends Error {
+	readonly channelId: string;
+	readonly messageId: string;
+
+	constructor(channelId: string, messageId: string) {
+		super(
+			`[ALERT] Untracked panel message remains and requires manual deletion: channelId=${channelId}, messageId=${messageId}`,
+		);
+		this.name = 'PanelRollbackFailedError';
+		this.channelId = channelId;
+		this.messageId = messageId;
+	}
+}
+
+async function deletePanelMessageWithRetry(params: {
+	rest: RestClient;
+	channelId: string;
+	messageId: string;
+}): Promise<boolean> {
+	const { rest, channelId, messageId } = params;
+
+	for (let attempt = 1; attempt <= DELETE_ROLLBACK_MAX_ATTEMPTS; attempt++) {
+		try {
+			const response = await rest('DELETE', $channels$_$messages$_, [channelId, messageId]);
+			if (response.ok || response.status === 404) {
+				return true;
+			}
+			const errorText = await response.text();
+			console.error(
+				`[ALERT] Rollback DELETE failed (attempt ${attempt}/${DELETE_ROLLBACK_MAX_ATTEMPTS}): channelId=${channelId}, messageId=${messageId}, status=${response.status}, body=${errorText}`,
+			);
+		} catch (error) {
+			console.error(
+				`[ALERT] Rollback DELETE threw (attempt ${attempt}/${DELETE_ROLLBACK_MAX_ATTEMPTS}): channelId=${channelId}, messageId=${messageId}`,
+				error,
+			);
+		}
+
+		if (attempt < DELETE_ROLLBACK_MAX_ATTEMPTS) {
+			await new Promise((resolve) => setTimeout(resolve, DELETE_ROLLBACK_BASE_DELAY_MS * attempt));
+		}
+	}
+
+	console.error(
+		`[ALERT] Untracked panel message remains and requires manual deletion: channelId=${channelId}, messageId=${messageId}`,
+	);
+	return false;
+}
+
 async function postAndReplacePanelMessage(params: {
 	rest: RestClient;
 	kv: PanelKvStore;
@@ -208,10 +259,13 @@ async function postAndReplacePanelMessage(params: {
 			return true;
 		} catch (backupPutError) {
 			console.error('Failed to persist panel state to backup KV key; rolling back posted panel:', backupPutError);
-			try {
-				await rest('DELETE', $channels$_$messages$_, [channelId, newMessageId]);
-			} catch (rollbackError) {
-				console.error('Failed to roll back posted panel message:', newMessageId, rollbackError);
+			const rolledBack = await deletePanelMessageWithRetry({
+				rest,
+				channelId,
+				messageId: newMessageId,
+			});
+			if (!rolledBack) {
+				throw new PanelRollbackFailedError(channelId, newMessageId);
 			}
 			throw backupPutError;
 		}
@@ -251,6 +305,12 @@ export const panelCommand = factory.command(
 				await deferred.followup('送信パネルを設置しました。');
 			} catch (error) {
 				console.error('Unexpected error while posting panel message:', error);
+				if (error instanceof PanelRollbackFailedError) {
+					await deferred.followup(
+						`送信パネルの設置に失敗し、ロールバックも失敗しました。手動で削除してください (channelId: ${error.channelId}, messageId: ${error.messageId})。`,
+					);
+					return;
+				}
 				await deferred.followup('送信パネルの設置中にエラーが発生しました。');
 			}
 		});
