@@ -19,6 +19,8 @@ const MODAL_ID = 'anonymous_modal';
 const INPUT_ID = 'message_content';
 const PANEL_KV_KEY_PREFIX = 'panel_message:';
 const MAX_PENDING_DELETE_IDS = 10;
+const KV_PUT_MAX_ATTEMPTS = 3;
+const KV_PUT_BASE_DELAY_MS = 1000;
 
 const openModalButton = makeButton(BUTTON_ID, '匿名メッセージを送る', buttonStyle.Primary);
 
@@ -116,6 +118,22 @@ function validateChannelAndEnv(params: {
 	return { ok: true, targetChannelId, kv: params.env.PANEL_KV };
 }
 
+async function putWithBackoff(kv: PanelKvStore, key: string, value: string): Promise<void> {
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= KV_PUT_MAX_ATTEMPTS; attempt++) {
+		try {
+			await kv.put(key, value);
+			return;
+		} catch (error) {
+			lastError = error;
+			if (attempt < KV_PUT_MAX_ATTEMPTS) {
+				await new Promise((resolve) => setTimeout(resolve, KV_PUT_BASE_DELAY_MS * attempt));
+			}
+		}
+	}
+	throw lastError;
+}
+
 async function postAndReplacePanelMessage(params: {
 	rest: RestClient;
 	kv: PanelKvStore;
@@ -163,7 +181,7 @@ async function postAndReplacePanelMessage(params: {
 		pendingDeleteIds: remainingPendingIds.slice(-MAX_PENDING_DELETE_IDS),
 	} satisfies PanelState;
 
-	await kv.put(kvKey, JSON.stringify(nextState));
+	await putWithBackoff(kv, kvKey, JSON.stringify(nextState));
 	return true;
 }
 

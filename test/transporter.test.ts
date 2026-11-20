@@ -223,6 +223,7 @@ function createModalInteraction(params: {
 
 describe('anonymous transporter bot', () => {
 	afterEach(() => {
+		vi.useRealTimers();
 		vi.restoreAllMocks();
 	});
 
@@ -538,12 +539,67 @@ describe('anonymous transporter bot', () => {
 		});
 	});
 
-	it('notifies accurately when forwarding succeeds but KV put throws', async () => {
+	it('retries kv.put with backoff without rerunning panel POST', async () => {
+		vi.useFakeTimers();
+		const app = createTestApp();
+		const { env, kv, store } = createTestEnv();
+		const { ctx, flush } = createExecutionContext();
+
+		let putAttempts = 0;
+		vi.spyOn(kv, 'put').mockImplementation(async (key, value) => {
+			putAttempts += 1;
+			if (putAttempts === 1) {
+				throw new Error('429 Too Many Requests');
+			}
+			store.set(key, value);
+		});
+
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'forwarded-msg-1' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ id: 'new-panel-msg-2' }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				}),
+			)
+			.mockResolvedValue(new Response(null, { status: 200 }));
+
+		const interaction = createModalInteraction({
+			applicationId: env.DISCORD_APPLICATION_ID,
+			channelId: TARGET_CHANNEL_ID,
+			value: 'リトライテスト',
+		});
+
+		await app.fetch(createInteractionRequest(interaction), env, ctx);
+		const flushPromise = flush();
+		await vi.runAllTimersAsync();
+		await flushPromise;
+
+		expect(putAttempts).toBe(2);
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		expect(JSON.parse(store.get(`panel_message:${TARGET_CHANNEL_ID}`) ?? '')).toEqual({
+			currentId: 'new-panel-msg-2',
+			pendingDeleteIds: [],
+		});
+		const [, followupInit] = fetchMock.mock.calls[2]!;
+		expect(JSON.parse(String(followupInit?.body))).toMatchObject({
+			content: 'メッセージを送信しました。',
+		});
+	});
+
+	it('notifies accurately when forwarding succeeds but KV put throws after retries', async () => {
+		vi.useFakeTimers();
 		const app = createTestApp();
 		const { env, kv } = createTestEnv();
 		const { ctx, flush } = createExecutionContext();
 		vi.spyOn(console, 'error').mockImplementation(() => {});
-		vi.spyOn(kv, 'put').mockRejectedValueOnce(new Error('429 Too Many Requests'));
+		const putMock = vi.spyOn(kv, 'put').mockRejectedValue(new Error('429 Too Many Requests'));
 
 		const fetchMock = vi
 			.spyOn(globalThis, 'fetch')
@@ -568,8 +624,11 @@ describe('anonymous transporter bot', () => {
 		});
 
 		await app.fetch(createInteractionRequest(interaction), env, ctx);
-		await flush();
+		const flushPromise = flush();
+		await vi.runAllTimersAsync();
+		await flushPromise;
 
+		expect(putMock).toHaveBeenCalledTimes(3);
 		const [, followupInit] = fetchMock.mock.calls[2]!;
 		expect(JSON.parse(String(followupInit?.body))).toMatchObject({
 			content: 'メッセージは送信しましたが、送信パネルの更新に失敗しました。',
