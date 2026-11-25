@@ -16,8 +16,7 @@
 		{
 			"binding": "REMINDER_DB",
 			"database_name": "funya-ojisan-reminder",
-			// TODO: `pnpm exec wrangler d1 create funya-ojisan-reminder` で作成した ID に置き換える
-			"database_id": "00000000-0000-0000-0000-000000000000",
+			"database_id": "65282223-fe9f-41ed-b1c8-7f7994a996d2",
 			"migrations_dir": "migrations"
 		}
 	],
@@ -42,8 +41,7 @@
 			{
 				"binding": "REMINDER_DB",
 				"database_name": "funya-ojisan-reminder",
-				// TODO: `pnpm exec wrangler d1 create funya-ojisan-reminder` で作成した ID に置き換える
-				"database_id": "00000000-0000-0000-0000-000000000000",
+				"database_id": "65282223-fe9f-41ed-b1c8-7f7994a996d2",
 				"migrations_dir": "migrations"
 			}
 		]
