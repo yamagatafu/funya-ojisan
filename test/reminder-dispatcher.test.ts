@@ -269,6 +269,69 @@ describe('dispatchDueJobs', () => {
 		]);
 	});
 
+	it('does not duplicate jobs or decrement twice when post-send processing fails and is retried', async () => {
+		const { db, id } = await setup({ remaining_count: 3, nag_interval_minutes: 30, nag_max_count: 2 });
+		const fetchMock = mockDiscord();
+		const now = jstToUtcMs('2026-11-25', 9 * 60);
+		const batch = db.batch.bind(db);
+		const batchSpy = vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
+
+		await dispatchDueJobs({ db, rest, now: () => now });
+		// 送信済みだが後処理は反映されていない
+		expect(jobs(db).map((job) => [job.kind, job.status])).toEqual([['main', 'pending']]);
+		expect((await getReminder(db, id))?.remaining_count).toBe(3);
+
+		batchSpy.mockImplementation(batch);
+		await dispatchDueJobs({ db, rest, now: () => now + MINUTE_MS });
+
+		expect(calls(fetchMock).filter((call) => call.method === 'POST')).toHaveLength(1);
+		expect((await getReminder(db, id))?.remaining_count).toBe(2);
+		expect(jobs(db).map((job) => [job.kind, job.status])).toEqual([
+			['main', 'sent'],
+			['nag', 'pending'],
+			['main', 'pending'],
+		]);
+	});
+
+	it('does not resend a nag when post-send processing fails and is retried', async () => {
+		const { db } = await setup({ nag_interval_minutes: 10, nag_max_count: 2 });
+		const fetchMock = mockDiscord();
+		const start = jstToUtcMs('2026-11-25', 9 * 60);
+		await dispatchDueJobs({ db, rest, now: () => start });
+
+		const batch = db.batch.bind(db);
+		const batchSpy = vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
+		await dispatchDueJobs({ db, rest, now: () => start + 10 * MINUTE_MS });
+		batchSpy.mockImplementation(batch);
+		await dispatchDueJobs({ db, rest, now: () => start + 11 * MINUTE_MS });
+
+		const posts = calls(fetchMock).filter((call) => call.method === 'POST');
+		expect(posts).toHaveLength(2);
+		expect(posts[1]?.body.content).toContain('再通知 (1/2)');
+		expect(occurrences(db)).toMatchObject([{ nag_count: 1, last_message_id: 'msg-2' }]);
+		expect(
+			jobs(db)
+				.filter((job) => job.kind === 'nag')
+				.map((job) => job.status),
+		).toEqual(['sent', 'pending']);
+	});
+
+	it('does not send nags beyond the max count', async () => {
+		const { db, id } = await setup({ nag_interval_minutes: 10, nag_max_count: 1 });
+		const now = jstToUtcMs('2026-11-25', 9 * 60);
+		db.raw.exec(
+			`INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state, last_message_id, nag_count) VALUES (${id}, ${now}, 'open', 'msg-x', 1)`,
+		);
+		db.raw.exec("UPDATE reminder_jobs SET status = 'cancelled' WHERE kind = 'main'");
+		await insertJob(db, { reminderId: id, occurrenceId: 1, kind: 'nag', runAt: now, scheduledAt: now }, now);
+		const fetchMock = mockDiscord();
+
+		await dispatchDueJobs({ db, rest, now: () => now });
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(jobs(db).find((job) => job.kind === 'nag')?.status).toBe('cancelled');
+	});
+
 	it('cancels follow-up jobs of a completed occurrence', async () => {
 		const { db, id } = await setup();
 		const now = jstToUtcMs('2026-11-25', 9 * 60);

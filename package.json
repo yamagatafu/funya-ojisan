@@ -6,7 +6,7 @@
 	"description": "Anonymous message transporter Discord bot built with discord-hono on Cloudflare Workers",
 	"packageManager": "pnpm@10.34.5",
 	"engines": {
-		"node": ">=22.0.0"
+		"node": ">=22.13.0"
 	},
 	"scripts": {
 		"dev": "wrangler dev",

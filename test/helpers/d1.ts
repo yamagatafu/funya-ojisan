@@ -1,15 +1,20 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import type { DbStatement, ReminderDb } from '../../src/types.ts';
 
-const MIGRATION_URL = new URL('../../migrations/0001_reminders.sql', import.meta.url);
+const MIGRATIONS_DIR = new URL('../../migrations/', import.meta.url);
 
 /** node:sqlite を D1 互換のインターフェースで包んだテスト用データベース (マイグレーション適用済み) */
 export function createTestDb(): ReminderDb & { raw: DatabaseSync } {
 	const raw = new DatabaseSync(':memory:');
 	// D1 は外部キー制約が常に有効
 	raw.exec('PRAGMA foreign_keys = ON;');
-	raw.exec(readFileSync(MIGRATION_URL, 'utf-8'));
+	// wrangler と同じくファイル名順にすべてのマイグレーションを適用する
+	for (const file of readdirSync(MIGRATIONS_DIR)
+		.filter((name) => name.endsWith('.sql'))
+		.sort()) {
+		raw.exec(readFileSync(new URL(file, MIGRATIONS_DIR), 'utf-8'));
+	}
 
 	const createStatement = (query: string, values: unknown[] = []): DbStatement & { execute(): unknown } => {
 		const params = values.map((value) => {

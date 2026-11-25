@@ -1,27 +1,33 @@
 import type { RESTPostAPIChannelMessageJSONBody } from 'discord-api-types/v10';
 import { $channels$_$messages, $channels$_$messages$_, type createRest } from 'discord-hono';
-import type { ReminderDb } from '../types.ts';
+import type { DbStatement, ReminderDb } from '../types.ts';
 import { MINUTE_MS } from './date.ts';
 import { buildNotification, buildPreNotification, type MessagePayload } from './message.ts';
 import {
 	cancelPendingJobs,
+	cancelPendingJobsStatement,
 	claimJob,
 	cleanupExpired,
 	closeOccurrence,
+	closeOccurrenceStatement,
 	findDueJobs,
 	getOccurrence,
 	getReminder,
-	insertJob,
+	insertJobStatement,
 	insertOccurrence,
 	type JobRow,
 	listOpenOccurrences,
 	type OccurrenceRow,
 	type ReminderRow,
+	recordJobSentMessage,
 	updateJob,
+	updateJobStatement,
 	updateOccurrence,
+	updateOccurrenceStatement,
 	updateReminder,
+	updateReminderStatement,
 } from './repository.ts';
-import { scheduleUpcoming } from './service.ts';
+import { planUpcoming } from './service.ts';
 
 export type Rest = ReturnType<typeof createRest>;
 
@@ -170,17 +176,18 @@ async function processPreJob(ctx: DispatchContext, job: JobRow, reminder: Remind
 	}
 }
 
-async function scheduleNag(
+/** 再通知ジョブを登録する SQL 文 (上限に達していれば null) */
+function nagStatement(
 	ctx: DispatchContext,
 	reminder: ReminderRow,
 	occurrence: Pick<OccurrenceRow, 'id' | 'scheduled_at'>,
 	nagCount: number,
-): Promise<void> {
+): DbStatement | null {
 	if (!reminder.nag_interval_minutes || nagCount >= (reminder.nag_max_count ?? 0)) {
-		return;
+		return null;
 	}
 	const now = ctx.now();
-	await insertJob(
+	return insertJobStatement(
 		ctx.db,
 		{
 			reminderId: reminder.id,
@@ -193,22 +200,34 @@ async function scheduleNag(
 	);
 }
 
-/** 前の回の通知を置き換え済みにし、再通知・スヌーズを止めてボタンを外す */
-async function supersedeOpenOccurrences(ctx: DispatchContext, reminder: ReminderRow, keepId: number): Promise<void> {
+/** 前の回の通知を置き換え済みにし、再通知・スヌーズを止める SQL 文と、ボタンを外す対象のメッセージ */
+async function planSupersede(
+	ctx: DispatchContext,
+	reminder: ReminderRow,
+	keepId: number,
+): Promise<{ statements: DbStatement[]; messageIds: (string | null)[] }> {
+	const statements: DbStatement[] = [];
+	const messageIds: (string | null)[] = [];
+	const now = ctx.now();
 	for (const occurrence of await listOpenOccurrences(ctx.db, reminder.id)) {
 		if (occurrence.id === keepId) {
 			continue;
 		}
-		const now = ctx.now();
-		if (await closeOccurrence(ctx.db, occurrence.id, 'superseded', { now })) {
-			await cancelPendingJobs(
+		statements.push(
+			closeOccurrenceStatement(ctx.db, occurrence.id, 'superseded', { now }),
+			cancelPendingJobsStatement(
 				ctx.db,
 				{ reminderId: reminder.id, occurrenceId: occurrence.id, kinds: ['nag', 'snooze'] },
 				now,
-			);
-			await removeButtons(ctx.rest, reminder.channel_id, occurrence.last_message_id);
-		}
+			),
+		);
+		messageIds.push(occurrence.last_message_id);
 	}
+	return { statements, messageIds };
+}
+
+function compact(statements: (DbStatement | null)[]): DbStatement[] {
+	return statements.filter((statement): statement is DbStatement => statement !== null);
 }
 
 async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: ReminderRow): Promise<void> {
@@ -249,21 +268,32 @@ async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: Remin
 		await updateOccurrence(ctx.db, occurrence.id, { last_message_id: outcome.messageId });
 	}
 
-	await supersedeOpenOccurrences(ctx, reminder, occurrence.id);
-	await scheduleNag(ctx, reminder, occurrence, occurrence.nag_count);
-
-	const remainingCount = reminder.remaining_count === null ? null : Math.max(0, reminder.remaining_count - 1);
+	// 送信後の処理は 1 つの batch (トランザクション) で行う。
+	// 途中で失敗しても何も反映されないため、再試行で重複登録や残り回数の二重減算が起きない
 	const now = ctx.now();
-	if (remainingCount !== null) {
-		await updateReminder(ctx.db, reminder.id, { remaining_count: remainingCount }, now);
-	}
-	await scheduleUpcoming(
+	const remainingCount = reminder.remaining_count === null ? null : Math.max(0, reminder.remaining_count - 1);
+	const supersede = await planSupersede(ctx, reminder, occurrence.id);
+	const upcoming = planUpcoming(
 		ctx.db,
 		{ ...reminder, remaining_count: remainingCount },
 		Math.max(job.scheduled_at, now),
 		now,
 	);
-	await finishJob(ctx, job, 'sent');
+	await ctx.db.batch(
+		compact([
+			...supersede.statements,
+			nagStatement(ctx, reminder, occurrence, occurrence.nag_count),
+			remainingCount === null
+				? null
+				: updateReminderStatement(ctx.db, reminder.id, { remaining_count: remainingCount }, now),
+			...upcoming.statements,
+			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now),
+		]),
+	);
+
+	for (const messageId of supersede.messageIds) {
+		await removeButtons(ctx.rest, reminder.channel_id, messageId);
+	}
 }
 
 async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: ReminderRow): Promise<void> {
@@ -275,26 +305,46 @@ async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: R
 
 	const isNag = job.kind === 'nag';
 	const nagCount = isNag ? occurrence.nag_count + 1 : occurrence.nag_count;
-	const outcome = await postMessage(
-		ctx.rest,
-		reminder.channel_id,
-		buildNotification(reminder, {
-			kind: isNag ? 'nag' : 'snooze',
-			occurrenceId: occurrence.id,
-			scheduledAt: occurrence.scheduled_at,
-			nagIndex: nagCount,
-			now: ctx.now(),
-		}),
-	);
-	if (outcome.type !== 'ok') {
-		await handleSendFailure(ctx, job, reminder, outcome, null);
+	if (isNag && nagCount > (reminder.nag_max_count ?? 0)) {
+		// 上限を超える再通知は送らない
+		await finishJob(ctx, job, 'cancelled');
 		return;
 	}
 
-	await removeButtons(ctx.rest, reminder.channel_id, occurrence.last_message_id);
-	await updateOccurrence(ctx.db, occurrence.id, { last_message_id: outcome.messageId, nag_count: nagCount });
-	await scheduleNag(ctx, reminder, occurrence, nagCount);
-	await finishJob(ctx, job, 'sent');
+	// 前回の実行が送信後に中断していた場合は、送信済みのメッセージを使い回す (再送の防止)
+	let messageId = job.sent_message_id;
+	if (!messageId) {
+		const outcome = await postMessage(
+			ctx.rest,
+			reminder.channel_id,
+			buildNotification(reminder, {
+				kind: isNag ? 'nag' : 'snooze',
+				occurrenceId: occurrence.id,
+				scheduledAt: occurrence.scheduled_at,
+				nagIndex: nagCount,
+				now: ctx.now(),
+			}),
+		);
+		if (outcome.type !== 'ok') {
+			await handleSendFailure(ctx, job, reminder, outcome, null);
+			return;
+		}
+		messageId = outcome.messageId;
+		await recordJobSentMessage(ctx.db, job.id, messageId);
+	}
+
+	const now = ctx.now();
+	await ctx.db.batch(
+		compact([
+			updateOccurrenceStatement(ctx.db, occurrence.id, { last_message_id: messageId, nag_count: nagCount }),
+			nagStatement(ctx, reminder, occurrence, nagCount),
+			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now),
+		]),
+	);
+
+	if (occurrence.last_message_id !== messageId) {
+		await removeButtons(ctx.rest, reminder.channel_id, occurrence.last_message_id);
+	}
 }
 
 async function processJob(ctx: DispatchContext, job: JobRow): Promise<void> {

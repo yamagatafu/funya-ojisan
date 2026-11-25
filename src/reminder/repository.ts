@@ -1,4 +1,4 @@
-import type { ReminderDb } from '../types.ts';
+import type { DbStatement, ReminderDb } from '../types.ts';
 import type { HolidayPolicy, ScheduleType } from './schedule.ts';
 
 export type MentionType = 'self' | 'user' | 'role' | 'none';
@@ -65,6 +65,8 @@ export interface JobRow {
 	status: JobStatus;
 	attempt_count: number;
 	locked_at: number | null;
+	/** 送信済みのメッセージ ID (送信後の処理が失敗した場合の再送防止) */
+	sent_message_id: string | null;
 	updated_at: number;
 }
 
@@ -119,18 +121,26 @@ export function getReminder(db: ReminderDb, id: number): Promise<ReminderRow | n
 	return db.prepare('SELECT * FROM reminders WHERE id = ?').bind(id).first<ReminderRow>();
 }
 
-export async function updateReminder(db: ReminderDb, id: number, update: ReminderUpdate, now: number): Promise<void> {
+export function updateReminderStatement(
+	db: ReminderDb,
+	id: number,
+	update: ReminderUpdate,
+	now: number,
+): DbStatement | null {
 	const entries = Object.entries(update).filter(
 		([column, value]) => REMINDER_UPDATABLE_COLUMNS.has(column) && value !== undefined,
 	);
 	if (entries.length === 0) {
-		return;
+		return null;
 	}
 	const assignments = [...entries.map(([column]) => `${column} = ?`), 'updated_at = ?'];
-	await db
+	return db
 		.prepare(`UPDATE reminders SET ${assignments.join(', ')} WHERE id = ?`)
-		.bind(...entries.map(([, value]) => value), now, id)
-		.run();
+		.bind(...entries.map(([, value]) => value), now, id);
+}
+
+export async function updateReminder(db: ReminderDb, id: number, update: ReminderUpdate, now: number): Promise<void> {
+	await updateReminderStatement(db, id, update, now)?.run();
 }
 
 export async function deleteReminder(db: ReminderDb, id: number): Promise<void> {
@@ -201,21 +211,42 @@ export async function deleteOccurrence(db: ReminderDb, id: number): Promise<void
 	await db.prepare('DELETE FROM reminder_occurrences WHERE id = ?').bind(id).run();
 }
 
+export function updateOccurrenceStatement(
+	db: ReminderDb,
+	id: number,
+	update: Partial<Omit<OccurrenceRow, 'id' | 'reminder_id' | 'scheduled_at'>>,
+): DbStatement | null {
+	const entries = Object.entries(update).filter(([, value]) => value !== undefined);
+	if (entries.length === 0) {
+		return null;
+	}
+	return db
+		.prepare(
+			`UPDATE reminder_occurrences SET ${entries.map(([column]) => `${column} = ?`).join(', ')} WHERE id = ?`,
+		)
+		.bind(...entries.map(([, value]) => value), id);
+}
+
 export async function updateOccurrence(
 	db: ReminderDb,
 	id: number,
 	update: Partial<Omit<OccurrenceRow, 'id' | 'reminder_id' | 'scheduled_at'>>,
 ): Promise<void> {
-	const entries = Object.entries(update).filter(([, value]) => value !== undefined);
-	if (entries.length === 0) {
-		return;
-	}
-	await db
+	await updateOccurrenceStatement(db, id, update)?.run();
+}
+
+/** open の状態を条件に完了・置き換えを行う SQL 文 */
+export function closeOccurrenceStatement(
+	db: ReminderDb,
+	id: number,
+	state: Exclude<OccurrenceState, 'open'>,
+	params: { by?: string; now: number },
+): DbStatement {
+	return db
 		.prepare(
-			`UPDATE reminder_occurrences SET ${entries.map(([column]) => `${column} = ?`).join(', ')} WHERE id = ?`,
+			"UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE id = ? AND state = 'open'",
 		)
-		.bind(...entries.map(([, value]) => value), id)
-		.run();
+		.bind(state, params.by ?? null, params.now, id);
 }
 
 /** open の状態を条件に完了・置き換えを行う。他の処理と競合した場合は false */
@@ -225,12 +256,7 @@ export async function closeOccurrence(
 	state: Exclude<OccurrenceState, 'open'>,
 	params: { by?: string; now: number },
 ): Promise<boolean> {
-	const result = await db
-		.prepare(
-			"UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE id = ? AND state = 'open'",
-		)
-		.bind(state, params.by ?? null, params.now, id)
-		.run();
+	const result = await closeOccurrenceStatement(db, id, state, params).run();
 	return result.meta.changes === 1;
 }
 
@@ -244,15 +270,24 @@ export async function listOpenOccurrences(db: ReminderDb, reminderId: number): P
 
 // ---- jobs ----
 
-export async function insertJob(
-	db: ReminderDb,
-	job: { reminderId: number; occurrenceId: number | null; kind: JobKind; runAt: number; scheduledAt: number },
-	now: number,
-): Promise<number> {
+export interface NewJob {
+	reminderId: number;
+	occurrenceId: number | null;
+	kind: JobKind;
+	runAt: number;
+	scheduledAt: number;
+}
+
+const INSERT_JOB_SQL =
+	"INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)";
+
+export function insertJobStatement(db: ReminderDb, job: NewJob, now: number): DbStatement {
+	return db.prepare(INSERT_JOB_SQL).bind(job.reminderId, job.occurrenceId, job.kind, job.runAt, job.scheduledAt, now);
+}
+
+export async function insertJob(db: ReminderDb, job: NewJob, now: number): Promise<number> {
 	const row = await db
-		.prepare(
-			"INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?) RETURNING id",
-		)
+		.prepare(`${INSERT_JOB_SQL} RETURNING id`)
 		.bind(job.reminderId, job.occurrenceId, job.kind, job.runAt, job.scheduledAt, now)
 		.first<{ id: number }>();
 	if (!row) {
@@ -273,12 +308,12 @@ export async function listPendingJobs(db: ReminderDb, reminderId: number): Promi
 	return results;
 }
 
-/** 未送信のジョブを取り消す。kinds を省略するとすべての種類が対象 */
-export async function cancelPendingJobs(
+/** 未送信のジョブを取り消す SQL 文。kinds を省略するとすべての種類が対象 */
+export function cancelPendingJobsStatement(
 	db: ReminderDb,
 	params: { reminderId: number; occurrenceId?: number; kinds?: JobKind[] },
 	now: number,
-): Promise<void> {
+): DbStatement {
 	const conditions = ['reminder_id = ?', "status = 'pending'"];
 	const values: unknown[] = [params.reminderId];
 	if (params.occurrenceId !== undefined) {
@@ -289,10 +324,18 @@ export async function cancelPendingJobs(
 		conditions.push(`kind IN (${params.kinds.map(() => '?').join(', ')})`);
 		values.push(...params.kinds);
 	}
-	await db
+	return db
 		.prepare(`UPDATE reminder_jobs SET status = 'cancelled', updated_at = ? WHERE ${conditions.join(' AND ')}`)
-		.bind(now, ...values)
-		.run();
+		.bind(now, ...values);
+}
+
+/** 未送信のジョブを取り消す。kinds を省略するとすべての種類が対象 */
+export async function cancelPendingJobs(
+	db: ReminderDb,
+	params: { reminderId: number; occurrenceId?: number; kinds?: JobKind[] },
+	now: number,
+): Promise<void> {
+	await cancelPendingJobsStatement(db, params, now).run();
 }
 
 export async function findDueJobs(db: ReminderDb, now: number, limit: number): Promise<JobRow[]> {
@@ -316,19 +359,25 @@ export async function claimJob(db: ReminderDb, id: number, now: number): Promise
 	return result.meta.changes === 1;
 }
 
-export async function updateJob(
-	db: ReminderDb,
-	id: number,
-	update: Partial<Pick<JobRow, 'status' | 'run_at' | 'attempt_count' | 'occurrence_id'>>,
-	now: number,
-): Promise<void> {
+export type JobUpdate = Partial<Pick<JobRow, 'status' | 'run_at' | 'attempt_count' | 'occurrence_id'>>;
+
+/** ジョブを更新する SQL 文。ロックは解除する */
+export function updateJobStatement(db: ReminderDb, id: number, update: JobUpdate, now: number): DbStatement {
 	const entries = Object.entries(update).filter(([, value]) => value !== undefined);
-	await db
+	return db
 		.prepare(
 			`UPDATE reminder_jobs SET ${[...entries.map(([column]) => `${column} = ?`), 'locked_at = NULL', 'updated_at = ?'].join(', ')} WHERE id = ?`,
 		)
-		.bind(...entries.map(([, value]) => value), now, id)
-		.run();
+		.bind(...entries.map(([, value]) => value), now, id);
+}
+
+export async function updateJob(db: ReminderDb, id: number, update: JobUpdate, now: number): Promise<void> {
+	await updateJobStatement(db, id, update, now).run();
+}
+
+/** 送信済みのメッセージ ID を記録する (再試行時の二重送信防止。ロックは維持する) */
+export async function recordJobSentMessage(db: ReminderDb, id: number, messageId: string): Promise<void> {
+	await db.prepare('UPDATE reminder_jobs SET sent_message_id = ? WHERE id = ?').bind(messageId, id).run();
 }
 
 // ---- maintenance ----
