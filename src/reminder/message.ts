@@ -1,4 +1,10 @@
-import { ButtonStyle, ComponentType } from 'discord-api-types/v10';
+import {
+	type APIActionRowComponent,
+	type APIButtonComponentWithCustomId,
+	ButtonStyle,
+	ComponentType,
+	type RESTPostAPIChannelMessageJSONBody,
+} from 'discord-api-types/v10';
 import { formatJstDateTime, formatJstTime, MINUTE_MS, utcMsToJst } from './date.ts';
 import { describeSchedule } from './format.ts';
 import type { ReminderRow } from './repository.ts';
@@ -12,11 +18,9 @@ export const SNOOZE_PRESET_MINUTES = [5, 15, 30] as const;
 /** これ以上遅れて送る本通知には遅延の注記を付ける */
 const LATE_NOTICE_THRESHOLD_MS = 5 * MINUTE_MS;
 
-export interface MessagePayload {
-	content: string;
-	components?: unknown[];
-	allowed_mentions: { parse: []; users?: string[]; roles?: string[] };
-}
+/** チャンネルに送信するメッセージ (Discord の送信ペイロードの一部) */
+export type MessagePayload = Required<Pick<RESTPostAPIChannelMessageJSONBody, 'content' | 'allowed_mentions'>> &
+	Pick<RESTPostAPIChannelMessageJSONBody, 'components'>;
 
 export function mentionTargetOf(reminder: Pick<ReminderRow, 'mention_type' | 'mention_target_id' | 'owner_id'>): {
 	text: string;
@@ -56,7 +60,7 @@ function body(reminder: ReminderRow): string[] {
 	return lines;
 }
 
-export function buildActionButtons(occurrenceId: number): unknown[] {
+export function buildActionButtons(occurrenceId: number): APIActionRowComponent<APIButtonComponentWithCustomId>[] {
 	return [
 		{
 			type: ComponentType.ActionRow,
@@ -68,13 +72,15 @@ export function buildActionButtons(occurrenceId: number): unknown[] {
 					emoji: { name: '✅' },
 					custom_id: `${DONE_BUTTON_ID};${occurrenceId}`,
 				},
-				...SNOOZE_PRESET_MINUTES.map((minutes) => ({
-					type: ComponentType.Button,
-					style: ButtonStyle.Secondary,
-					label: `${minutes}分`,
-					emoji: { name: '⏰' },
-					custom_id: `${SNOOZE_BUTTON_ID};${occurrenceId}:${minutes}`,
-				})),
+				...SNOOZE_PRESET_MINUTES.map(
+					(minutes): APIButtonComponentWithCustomId => ({
+						type: ComponentType.Button,
+						style: ButtonStyle.Secondary,
+						label: `${minutes}分`,
+						emoji: { name: '⏰' },
+						custom_id: `${SNOOZE_BUTTON_ID};${occurrenceId}:${minutes}`,
+					}),
+				),
 				{
 					type: ComponentType.Button,
 					style: ButtonStyle.Secondary,

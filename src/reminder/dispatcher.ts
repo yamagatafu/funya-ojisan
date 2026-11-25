@@ -8,6 +8,7 @@ import {
 	claimJob,
 	cleanupExpired,
 	closeOccurrenceStatement,
+	compact,
 	type ExtraCondition,
 	findDueJobs,
 	findRemindersWithoutSchedule,
@@ -76,14 +77,8 @@ export async function postMessage(
 ): Promise<SendOutcome> {
 	let response: Awaited<ReturnType<Rest>>;
 	try {
-		response = await rest(
-			'POST',
-			$channels$_$messages,
-			[channelId],
-			(nonce
-				? { ...payload, nonce, enforce_nonce: true }
-				: payload) as unknown as RESTPostAPIChannelMessageJSONBody,
-		);
+		const body: RESTPostAPIChannelMessageJSONBody = nonce ? { ...payload, nonce, enforce_nonce: true } : payload;
+		response = await rest('POST', $channels$_$messages, [channelId], body);
 	} catch (error) {
 		return { type: 'transient', detail: String(error) };
 	}
@@ -174,9 +169,9 @@ async function giveUp(
 					owned(job),
 				)
 			: null,
-		disable ? cancelPendingJobsStatement(ctx.db, { reminderId: job.reminder_id }, now) : null,
+		disable ? cancelPendingJobsStatement(ctx.db, { reminderId: job.reminder_id }, now, owned(job)) : null,
 		disable && params.occurrenceId !== null
-			? closeOccurrenceStatement(ctx.db, params.occurrenceId, 'superseded', { now })
+			? closeOccurrenceStatement(ctx.db, params.occurrenceId, 'superseded', { now }, owned(job))
 			: null,
 		updateJobStatement(ctx.db, job.id, { status: 'failed', attempt_count: attempts }, now, owned(job)),
 	]);
@@ -298,6 +293,7 @@ function nagStatement(
 /** 前の回の通知を置き換え済みにし、再通知・スヌーズを止める SQL 文と、ボタンを外す対象のメッセージ */
 async function planSupersede(
 	ctx: DispatchContext,
+	job: ClaimedJob,
 	reminder: ReminderRow,
 	keepId: number,
 ): Promise<{ statements: DbStatement[]; messages: SentMessage[] }> {
@@ -309,20 +305,17 @@ async function planSupersede(
 			continue;
 		}
 		statements.push(
-			closeOccurrenceStatement(ctx.db, occurrence.id, 'superseded', { now }),
+			closeOccurrenceStatement(ctx.db, occurrence.id, 'superseded', { now }, owned(job)),
 			cancelPendingJobsStatement(
 				ctx.db,
 				{ reminderId: reminder.id, occurrenceId: occurrence.id, kinds: ['nag', 'snooze'] },
 				now,
+				owned(job),
 			),
 		);
 		messages.push(sentMessageOf(occurrence, reminder));
 	}
 	return { statements, messages };
-}
-
-function compact(statements: (DbStatement | null)[]): DbStatement[] {
-	return statements.filter((statement): statement is DbStatement => statement !== null);
 }
 
 async function processMainJob(ctx: DispatchContext, job: ClaimedJob, reminder: ReminderRow): Promise<void> {
@@ -362,14 +355,14 @@ async function processMainJob(ctx: DispatchContext, job: ClaimedJob, reminder: R
 			await handleSendFailure(ctx, job, outcome, occurrence.id);
 			return;
 		}
-		await updateOccurrence(ctx.db, occurrence.id, { last_message_id: outcome.messageId });
+		await updateOccurrence(ctx.db, occurrence.id, { last_message_id: outcome.messageId }, owned(job));
 	}
 
 	// 送信後の処理は 1 つの batch (トランザクション) で行う。
 	// 途中で失敗しても何も反映されないため、再試行で重複登録や残り回数の二重減算が起きない
 	const now = ctx.now();
 	const remainingCount = reminder.remaining_count === null ? null : Math.max(0, reminder.remaining_count - 1);
-	const supersede = await planSupersede(ctx, reminder, occurrence.id);
+	const supersede = await planSupersede(ctx, job, reminder, occurrence.id);
 	// 次回の予定・残り回数・終了状態は、ジョブ取得時に読んだ内容から変更されていない場合だけ反映する。
 	// 処理中に編集・一時停止された場合は、編集側で登録した予定を優先する (古い内容で上書きしない)
 	const upcoming = planUpcoming(
@@ -436,13 +429,18 @@ async function processFollowUpJob(ctx: DispatchContext, job: ClaimedJob, reminde
 			return;
 		}
 		messageId = outcome.messageId;
-		await recordJobSentMessage(ctx.db, job.id, messageId);
+		await recordJobSentMessage(ctx.db, job.id, messageId, owned(job));
 	}
 
 	const now = ctx.now();
 	await ctx.db.batch(
 		compact([
-			updateOccurrenceStatement(ctx.db, occurrence.id, { last_message_id: messageId, nag_count: nagCount }),
+			updateOccurrenceStatement(
+				ctx.db,
+				occurrence.id,
+				{ last_message_id: messageId, nag_count: nagCount },
+				owned(job),
+			),
 			nagStatement(ctx, reminder, occurrence, nagCount, owned(job)),
 			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now, owned(job)),
 		]),

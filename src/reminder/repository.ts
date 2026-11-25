@@ -136,6 +136,11 @@ export interface ScheduleGuard {
 
 const GUARD_SQL = "EXISTS (SELECT 1 FROM reminders WHERE id = ? AND status = 'active' AND revision = ?)";
 
+/** batch に渡す SQL 文の配列から null (実行不要な文) を取り除く */
+export function compact(statements: (DbStatement | null)[]): DbStatement[] {
+	return statements.filter((statement): statement is DbStatement => statement !== null);
+}
+
 /** UPDATE / INSERT に追加する WHERE 条件 */
 export interface ExtraCondition {
 	sql: string;
@@ -271,24 +276,27 @@ export function updateOccurrenceStatement(
 	db: ReminderDb,
 	id: number,
 	update: Partial<Omit<OccurrenceRow, 'id' | 'reminder_id' | 'scheduled_at'>>,
+	condition?: ExtraCondition,
 ): DbStatement | null {
 	const entries = Object.entries(update).filter(([, value]) => value !== undefined);
 	if (entries.length === 0) {
 		return null;
 	}
+	const where = condition ? `id = ? AND ${condition.sql}` : 'id = ?';
 	return db
 		.prepare(
-			`UPDATE reminder_occurrences SET ${entries.map(([column]) => `${column} = ?`).join(', ')} WHERE id = ?`,
+			`UPDATE reminder_occurrences SET ${entries.map(([column]) => `${column} = ?`).join(', ')} WHERE ${where}`,
 		)
-		.bind(...entries.map(([, value]) => value), id);
+		.bind(...entries.map(([, value]) => value), id, ...(condition?.values ?? []));
 }
 
 export async function updateOccurrence(
 	db: ReminderDb,
 	id: number,
 	update: Partial<Omit<OccurrenceRow, 'id' | 'reminder_id' | 'scheduled_at'>>,
+	condition?: ExtraCondition,
 ): Promise<void> {
-	await updateOccurrenceStatement(db, id, update)?.run();
+	await updateOccurrenceStatement(db, id, update, condition)?.run();
 }
 
 /** open の状態を条件に完了・置き換えを行う SQL 文 */
@@ -297,12 +305,12 @@ export function closeOccurrenceStatement(
 	id: number,
 	state: Exclude<OccurrenceState, 'open'>,
 	params: { by?: string; now: number },
+	condition?: ExtraCondition,
 ): DbStatement {
+	const where = condition ? `id = ? AND state = 'open' AND ${condition.sql}` : "id = ? AND state = 'open'";
 	return db
-		.prepare(
-			"UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE id = ? AND state = 'open'",
-		)
-		.bind(state, params.by ?? null, params.now, id);
+		.prepare(`UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE ${where}`)
+		.bind(state, params.by ?? null, params.now, id, ...(condition?.values ?? []));
 }
 
 /** open の状態を条件に完了・置き換えを行う。他の処理と競合した場合は false */
@@ -379,9 +387,14 @@ export function cancelPendingJobsStatement(
 	db: ReminderDb,
 	params: { reminderId: number; occurrenceId?: number; kinds?: JobKind[] },
 	now: number,
+	condition?: ExtraCondition,
 ): DbStatement {
 	const conditions = ['reminder_id = ?', "status = 'pending'"];
 	const values: unknown[] = [params.reminderId];
+	if (condition) {
+		conditions.push(condition.sql);
+		values.push(...condition.values);
+	}
 	if (params.occurrenceId !== undefined) {
 		conditions.push('occurrence_id = ?');
 		values.push(params.occurrenceId);
@@ -454,9 +467,18 @@ export async function updateJob(
 	await updateJobStatement(db, id, update, now, condition).run();
 }
 
-/** 送信済みのメッセージ ID を記録する (再試行時の二重送信防止。ロックは維持する) */
-export async function recordJobSentMessage(db: ReminderDb, id: number, messageId: string): Promise<void> {
-	await db.prepare('UPDATE reminder_jobs SET sent_message_id = ? WHERE id = ?').bind(messageId, id).run();
+/** 送信済みのメッセージ ID を記録する (再試行時の二重送信防止。ロックは維持する)。condition を満たす場合だけ記録する */
+export async function recordJobSentMessage(
+	db: ReminderDb,
+	id: number,
+	messageId: string,
+	condition?: ExtraCondition,
+): Promise<void> {
+	const where = condition ? `id = ? AND ${condition.sql}` : 'id = ?';
+	await db
+		.prepare(`UPDATE reminder_jobs SET sent_message_id = ? WHERE ${where}`)
+		.bind(messageId, id, ...(condition?.values ?? []))
+		.run();
 }
 
 // ---- maintenance ----

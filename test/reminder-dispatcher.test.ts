@@ -543,6 +543,32 @@ describe('dispatchDueJobs', () => {
 		expect(occurrences(db)).toMatchObject([{ channel_id: CHANNEL_ID }]);
 	});
 
+	it("does not cancel the new run's schedule when a run that lost its lock fails permanently", async () => {
+		const { db, id } = await setup();
+		const now = jstToUtcMs('2026-11-25', 9 * 60);
+		const next = jstToUtcMs('2026-11-26', 9 * 60);
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			// 古い実行の送信が止まっている間に、別の実行がジョブを再取得して完了し、次回の本通知を登録した状況を再現する
+			db.raw.exec(`UPDATE reminder_jobs SET status = 'sent', locked_at = NULL WHERE id = 1`);
+			await insertJob(
+				db,
+				{ reminderId: id, occurrenceId: null, kind: 'main', runAt: next, scheduledAt: next },
+				now,
+			);
+			// その後、古い実行が恒久エラーで復帰する
+			return new Response('{"message":"Missing Access"}', { status: 403 });
+		});
+
+		await dispatchDueJobs({ db, rest, now: () => now });
+
+		expect((await getReminder(db, id))?.status).toBe('active');
+		expect(jobs(db).map((job) => [job.kind, job.status, job.run_at])).toEqual([
+			['main', 'sent', now],
+			['main', 'pending', next],
+		]);
+		expect(occurrences(db).map((occurrence) => occurrence.state)).toEqual(['open']);
+	});
+
 	it('does not write results after the lock was taken over by another run', async () => {
 		const { db } = await setup({ nag_interval_minutes: 10, nag_max_count: 1 });
 		const now = jstToUtcMs('2026-11-25', 9 * 60);
