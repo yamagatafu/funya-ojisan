@@ -1,4 +1,4 @@
-import { formatDate, isValidCivilDate, jstToUtcMs, MINUTE_MS, utcMsToJst } from './date.ts';
+import { formatDate, isValidCivilDate, JST_OFFSET_MS, jstToUtcMs, MINUTE_MS, utcMsToJst } from './date.ts';
 
 /** 全角英数字・記号を半角に寄せ、前後の空白を除く */
 function normalize(input: string): string {
@@ -97,8 +97,11 @@ export function parseWeekdays(input: string): number | null {
 	return mask === 0 ? null : mask;
 }
 
-/** `Date` で表現できる最大の時刻 (UTC ms) */
-const MAX_DATE_MS = 8.64e15;
+/**
+ * 受け付ける最大の時刻 (UTC ms)。
+ * `Date` の上限 (8.64e15) から、JST 表示時に加える 9 時間を差し引いた値 (JST に変換しても表示できる範囲)
+ */
+export const MAX_SUPPORTED_MS = 8.64e15 - JST_OFFSET_MS;
 
 const DURATION_UNITS: Record<string, number> = {
 	日: 24 * 60,
@@ -142,8 +145,8 @@ export function parseWhen(input: string, nowMs: number): number | null {
 	const duration = parseDuration(value);
 	if (duration !== null) {
 		const ms = nowMs + duration * MINUTE_MS;
-		// Date で表現できない日時 (極端に大きな相対指定) は受け付けない
-		return Number.isFinite(ms) && ms <= MAX_DATE_MS ? ms : null;
+		// JST に変換して表示できない日時 (極端に大きな相対指定) は受け付けない
+		return Number.isFinite(ms) && ms <= MAX_SUPPORTED_MS ? ms : null;
 	}
 
 	const time = parseTime(value);

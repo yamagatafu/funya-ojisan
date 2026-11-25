@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { formatJstDateTime, jstToUtcMs } from '../src/reminder/date.ts';
-import { parseDate, parseDuration, parseTime, parseWeekdays, parseWhen } from '../src/reminder/parse.ts';
+import {
+	MAX_SUPPORTED_MS,
+	parseDate,
+	parseDuration,
+	parseTime,
+	parseWeekdays,
+	parseWhen,
+} from '../src/reminder/parse.ts';
 
 const NOW = jstToUtcMs('2026-11-25', 10 * 60); // 2026-11-25 (水) 10:00 JST
 
@@ -96,5 +103,15 @@ describe('parseWhen', () => {
 		expect(when('1000000000日')).toBeNull();
 		expect(when(`${'9'.repeat(400)}分`)).toBeNull();
 		expect(when('36500日')).toBe('2126-11-01 10:00');
+	});
+
+	it('accepts relative durations up to the boundary that can still be displayed in JST', () => {
+		const maxMinutes = Math.floor((MAX_SUPPORTED_MS - NOW) / 60_000);
+		const atBoundary = parseWhen(`${maxMinutes}分`, NOW);
+		expect(atBoundary).not.toBeNull();
+		expect(formatJstDateTime(atBoundary!)).toMatch(/^\d{4,}-\d{2}-\d{2} \d{2}:\d{2}$/);
+		expect(parseWhen(`${maxMinutes + 1}分`, NOW)).toBeNull();
+		// Date の上限ちょうど (JST 表示では範囲外になる値) は受け付けない
+		expect(parseWhen(`${Math.floor((8.64e15 - NOW) / 60_000)}分`, NOW)).toBeNull();
 	});
 });
