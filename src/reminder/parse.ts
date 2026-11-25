@@ -97,6 +97,9 @@ export function parseWeekdays(input: string): number | null {
 	return mask === 0 ? null : mask;
 }
 
+/** `Date` で表現できる最大の時刻 (UTC ms) */
+const MAX_DATE_MS = 8.64e15;
+
 const DURATION_UNITS: Record<string, number> = {
 	日: 24 * 60,
 	d: 24 * 60,
@@ -120,7 +123,8 @@ export function parseDuration(input: string): number | null {
 		total += Number(match[1]) * DURATION_UNITS[match[2]!]!;
 		consumed += match[0].length;
 	}
-	if (consumed !== value.length || total <= 0) {
+	// 桁数の多い入力で精度が落ちる・Infinity になる値は受け付けない
+	if (consumed !== value.length || total <= 0 || !Number.isSafeInteger(total)) {
 		return null;
 	}
 	return total;
@@ -137,7 +141,9 @@ export function parseWhen(input: string, nowMs: number): number | null {
 
 	const duration = parseDuration(value);
 	if (duration !== null) {
-		return nowMs + duration * MINUTE_MS;
+		const ms = nowMs + duration * MINUTE_MS;
+		// Date で表現できない日時 (極端に大きな相対指定) は受け付けない
+		return Number.isFinite(ms) && ms <= MAX_DATE_MS ? ms : null;
 	}
 
 	const time = parseTime(value);

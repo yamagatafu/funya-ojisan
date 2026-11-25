@@ -61,6 +61,11 @@ describe('parseDuration', () => {
 		expect(parseDuration('0分')).toBeNull();
 		expect(parseDuration('30分後')).toBeNull();
 	});
+
+	it('rejects durations that are too large to represent exactly', () => {
+		expect(parseDuration(`${'9'.repeat(400)}分`)).toBeNull();
+		expect(parseDuration('99999999999999999日')).toBeNull();
+	});
 });
 
 describe('parseWhen', () => {
@@ -85,5 +90,11 @@ describe('parseWhen', () => {
 
 	it('rejects unknown input', () => {
 		expect(when('あした')).toBeNull();
+	});
+
+	it('rejects relative durations beyond the representable date range', () => {
+		expect(when('1000000000日')).toBeNull();
+		expect(when(`${'9'.repeat(400)}分`)).toBeNull();
+		expect(when('36500日')).toBe('2126-11-01 10:00');
 	});
 });
