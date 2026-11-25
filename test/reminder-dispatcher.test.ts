@@ -465,7 +465,7 @@ describe('dispatchDueJobs', () => {
 			if (init?.method === 'POST') {
 				// 送信中に /remind edit で日時が変更された状況を再現する
 				db.raw.exec(
-					`UPDATE reminders SET once_at = ${editedOnceAt}, next_run_at = ${editedOnceAt}, updated_at = ${sentAt + 1} WHERE id = ${id}`,
+					`UPDATE reminders SET once_at = ${editedOnceAt}, next_run_at = ${editedOnceAt}, revision = revision + 1 WHERE id = ${id}`,
 				);
 				await insertJob(
 					db,
@@ -499,10 +499,10 @@ describe('dispatchDueJobs', () => {
 		const reminder = (await getReminder(db, id))!;
 		const now = jstToUtcMs('2026-11-25', 8 * 60);
 
-		await scheduleUpcoming(db, reminder, now, now, { guardUpdatedAt: reminder.updated_at - 1 });
+		await scheduleUpcoming(db, reminder, now, now, { guardRevision: reminder.revision + 1 });
 		expect(jobs(db).filter((job) => job.status === 'pending')).toHaveLength(0);
 
-		await scheduleUpcoming(db, reminder, now, now, { guardUpdatedAt: reminder.updated_at });
+		await scheduleUpcoming(db, reminder, now, now, { guardRevision: reminder.revision });
 		expect(jobs(db).filter((job) => job.status === 'pending')).toHaveLength(1);
 	});
 
@@ -540,6 +540,94 @@ describe('dispatchDueJobs', () => {
 			['PATCH', `${API}/channels/${CHANNEL_ID}/messages/msg-1`],
 		]);
 		expect(occurrences(db)).toMatchObject([{ channel_id: CHANNEL_ID }]);
+	});
+
+	it('does not write results after the lock was taken over by another run', async () => {
+		const { db } = await setup({ nag_interval_minutes: 10, nag_max_count: 1 });
+		const now = jstToUtcMs('2026-11-25', 9 * 60);
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+			if (init?.method === 'POST') {
+				// 送信中にロックが切れ、別の実行がジョブを再取得した状況を再現する
+				db.raw.exec(`UPDATE reminder_jobs SET locked_at = ${now + 6 * MINUTE_MS} WHERE id = 1`);
+				return jsonResponse({ id: 'msg-1' });
+			}
+			return jsonResponse({});
+		});
+
+		await dispatchDueJobs({ db, rest, now: () => now });
+
+		// 古い実行は次回ジョブも再通知も登録せず、ジョブも完了にしない
+		expect(jobs(db).map((job) => [job.kind, job.status, job.locked_at])).toEqual([
+			['main', 'processing', now + 6 * MINUTE_MS],
+		]);
+	});
+
+	for (const kind of ['main', 'nag'] as const) {
+		it(`keeps a ${kind} job at the attempt limit retryable when recording the failure fails`, async () => {
+			const { db, id } = await setup({ nag_interval_minutes: 10, nag_max_count: 3 });
+			const now = jstToUtcMs('2026-11-25', 9 * 60);
+			if (kind === 'nag') {
+				db.raw.exec("UPDATE reminder_jobs SET status = 'cancelled'");
+				db.raw.exec(
+					`INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state, last_message_id, channel_id) VALUES (${id}, ${now}, 'open', 'msg-x', '${CHANNEL_ID}')`,
+				);
+				await insertJob(
+					db,
+					{ reminderId: id, occurrenceId: 1, kind: 'nag', runAt: now, scheduledAt: now },
+					now,
+				);
+			}
+			db.raw.exec("UPDATE reminder_jobs SET attempt_count = 4 WHERE status = 'pending'");
+			vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+				new Response('{"message":"Missing Access"}', { status: 403 }),
+			);
+			const spy = failStatements(db, (query) => query.startsWith('UPDATE reminders SET status'));
+
+			await dispatchDueJobs({ db, rest, now: () => now });
+			spy.mockRestore();
+
+			// 状態が確定していないため、試行回数の上限にかかわらず再試行できる状態に残る
+			expect((await getReminder(db, id))?.status).toBe('active');
+			expect(jobs(db).find((job) => job.kind === kind && job.status !== 'cancelled')).toMatchObject({
+				status: 'pending',
+			});
+
+			await dispatchDueJobs({ db, rest, now: () => now + MINUTE_MS });
+			expect((await getReminder(db, id))?.status).toBe('error');
+			expect(jobs(db).find((job) => job.kind === kind && job.status !== 'cancelled')).toMatchObject({
+				status: 'failed',
+			});
+			if (kind === 'main') {
+				expect(occurrences(db)).toMatchObject([{ state: 'superseded' }]);
+			}
+		});
+	}
+
+	it('repairs a once reminder whose time has already passed by sending it late', async () => {
+		const { db, id } = await setup({ schedule_type: 'once', once_at: jstToUtcMs('2026-11-25', 9 * 60) });
+		db.raw.exec('DELETE FROM reminder_jobs');
+		const fetchMock = mockDiscord();
+
+		await dispatchDueJobs({ db, rest, now: () => jstToUtcMs('2026-11-25', 9 * 60 + 30) });
+		await dispatchDueJobs({ db, rest, now: () => jstToUtcMs('2026-11-25', 9 * 60 + 31) });
+
+		expect(calls(fetchMock)[0]?.body.content).toContain('リマインド（予定 09:00 から遅延）');
+		expect((await getReminder(db, id))?.status).toBe('ended');
+	});
+
+	it('retries a main notification in the channel recorded for the occurrence', async () => {
+		const { db, id } = await setup();
+		const now = jstToUtcMs('2026-11-25', 9 * 60);
+		db.raw.exec(
+			`INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state, channel_id) VALUES (${id}, ${now}, 'open', '${CHANNEL_ID}')`,
+		);
+		db.raw.exec('UPDATE reminder_jobs SET occurrence_id = 1 WHERE id = 1');
+		db.raw.exec(`UPDATE reminders SET channel_id = '299999999999999999' WHERE id = ${id}`);
+		const fetchMock = mockDiscord();
+
+		await dispatchDueJobs({ db, rest, now: () => now });
+
+		expect(calls(fetchMock)[0]?.url).toBe(`${API}/channels/${CHANNEL_ID}/messages`);
 	});
 
 	it('cancels follow-up jobs of a completed occurrence', async () => {

@@ -32,6 +32,8 @@ export interface ReminderRow {
 	status: ReminderStatus;
 	last_error: string | null;
 	next_run_at: number | null;
+	/** 更新のたびに 1 ずつ増える (migrations/0004)。読み取り後の変更検知に使う */
+	revision: number;
 	created_at: number;
 	updated_at: number;
 }
@@ -39,10 +41,10 @@ export interface ReminderRow {
 /** 登録時に指定する項目 */
 export type ReminderInput = Omit<
 	ReminderRow,
-	'id' | 'status' | 'last_error' | 'next_run_at' | 'created_at' | 'updated_at'
+	'id' | 'status' | 'last_error' | 'next_run_at' | 'revision' | 'created_at' | 'updated_at'
 >;
 
-export type ReminderUpdate = Partial<Omit<ReminderRow, 'id' | 'created_at' | 'updated_at'>>;
+export type ReminderUpdate = Partial<Omit<ReminderRow, 'id' | 'revision' | 'created_at' | 'updated_at'>>;
 
 export interface OccurrenceRow {
 	id: number;
@@ -124,15 +126,15 @@ export function getReminder(db: ReminderDb, id: number): Promise<ReminderRow | n
 }
 
 /**
- * スケジュールの更新を、リマインダが有効で、読み取り時から変更されていない (updated_at が一致する) 場合に限定する条件。
+ * スケジュールの更新を、リマインダが有効で、読み取り時から変更されていない (revision が一致する) 場合に限定する条件。
  * 一時停止・編集などと競合した場合に、古い内容で予定を登録したり状態を上書きしたりしないために使う。
  */
 export interface ScheduleGuard {
 	reminderId: number;
-	updatedAt: number;
+	revision: number;
 }
 
-const GUARD_SQL = "EXISTS (SELECT 1 FROM reminders WHERE id = ? AND status = 'active' AND updated_at = ?)";
+const GUARD_SQL = "EXISTS (SELECT 1 FROM reminders WHERE id = ? AND status = 'active' AND revision = ?)";
 
 /** UPDATE / INSERT に追加する WHERE 条件 */
 export interface ExtraCondition {
@@ -141,7 +143,31 @@ export interface ExtraCondition {
 }
 
 export function guardCondition(guard: ScheduleGuard): ExtraCondition {
-	return { sql: GUARD_SQL, values: [guard.reminderId, guard.updatedAt] };
+	return { sql: GUARD_SQL, values: [guard.reminderId, guard.revision] };
+}
+
+/** 複数の条件をすべて満たすことを表す条件 */
+export function allConditions(...conditions: (ExtraCondition | undefined)[]): ExtraCondition | undefined {
+	const present = conditions.filter((condition): condition is ExtraCondition => condition !== undefined);
+	if (present.length === 0) {
+		return undefined;
+	}
+	return {
+		sql: present.map((condition) => `(${condition.sql})`).join(' AND '),
+		values: present.flatMap((condition) => condition.values),
+	};
+}
+
+/**
+ * ジョブを確保した実行が、今もそのジョブのロックを持っていることを表す条件。
+ * ロックが切れて別の実行に再取得された後に、古い実行が結果を書き込まないために使う
+ * (再取得には 5 分以上の経過が必要なため、確保時刻の locked_at は実行ごとに異なる)。
+ */
+export function jobOwnershipCondition(jobId: number, lockedAt: number): ExtraCondition {
+	return {
+		sql: "EXISTS (SELECT 1 FROM reminder_jobs WHERE id = ? AND status = 'processing' AND locked_at = ?)",
+		values: [jobId, lockedAt],
+	};
 }
 
 export function updateReminderStatement(
@@ -157,7 +183,7 @@ export function updateReminderStatement(
 	if (entries.length === 0) {
 		return null;
 	}
-	const assignments = [...entries.map(([column]) => `${column} = ?`), 'updated_at = ?'];
+	const assignments = [...entries.map(([column]) => `${column} = ?`), 'revision = revision + 1', 'updated_at = ?'];
 	const where = condition ? `id = ? AND ${condition.sql}` : 'id = ?';
 	return db
 		.prepare(`UPDATE reminders SET ${assignments.join(', ')} WHERE ${where}`)
@@ -401,18 +427,31 @@ export async function claimJob(db: ReminderDb, id: number, now: number): Promise
 
 export type JobUpdate = Partial<Pick<JobRow, 'status' | 'run_at' | 'attempt_count' | 'occurrence_id'>>;
 
-/** ジョブを更新する SQL 文。ロックは解除する */
-export function updateJobStatement(db: ReminderDb, id: number, update: JobUpdate, now: number): DbStatement {
+/** ジョブを更新する SQL 文。ロックは解除する。condition を指定すると、その条件を満たす場合だけ更新する */
+export function updateJobStatement(
+	db: ReminderDb,
+	id: number,
+	update: JobUpdate,
+	now: number,
+	condition?: ExtraCondition,
+): DbStatement {
 	const entries = Object.entries(update).filter(([, value]) => value !== undefined);
+	const where = condition ? `id = ? AND ${condition.sql}` : 'id = ?';
 	return db
 		.prepare(
-			`UPDATE reminder_jobs SET ${[...entries.map(([column]) => `${column} = ?`), 'locked_at = NULL', 'updated_at = ?'].join(', ')} WHERE id = ?`,
+			`UPDATE reminder_jobs SET ${[...entries.map(([column]) => `${column} = ?`), 'locked_at = NULL', 'updated_at = ?'].join(', ')} WHERE ${where}`,
 		)
-		.bind(...entries.map(([, value]) => value), now, id);
+		.bind(...entries.map(([, value]) => value), now, id, ...(condition?.values ?? []));
 }
 
-export async function updateJob(db: ReminderDb, id: number, update: JobUpdate, now: number): Promise<void> {
-	await updateJobStatement(db, id, update, now).run();
+export async function updateJob(
+	db: ReminderDb,
+	id: number,
+	update: JobUpdate,
+	now: number,
+	condition?: ExtraCondition,
+): Promise<void> {
+	await updateJobStatement(db, id, update, now, condition).run();
 }
 
 /** 送信済みのメッセージ ID を記録する (再試行時の二重送信防止。ロックは維持する) */

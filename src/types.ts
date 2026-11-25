@@ -14,7 +14,8 @@ export interface DbStatement {
 
 export interface ReminderDb {
 	prepare(query: string): DbStatement;
-	batch(statements: DbStatement[]): Promise<unknown[]>;
+	/** 1 つのトランザクションで実行し、各文の結果 (RETURNING の行を含む) を返す */
+	batch<T = Record<string, unknown>>(statements: DbStatement[]): Promise<{ results: T[] }[]>;
 }
 
 export interface AppBindings {

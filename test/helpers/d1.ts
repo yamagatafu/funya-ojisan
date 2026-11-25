@@ -16,7 +16,10 @@ export function createTestDb(): ReminderDb & { raw: DatabaseSync } {
 		raw.exec(readFileSync(new URL(file, MIGRATIONS_DIR), 'utf-8'));
 	}
 
-	const createStatement = (query: string, values: unknown[] = []): DbStatement & { execute(): unknown } => {
+	const createStatement = (
+		query: string,
+		values: unknown[] = [],
+	): DbStatement & { execute(): { results: unknown[] } } => {
 		const params = values.map((value) => {
 			if (value === undefined) {
 				throw new Error('D1_TYPE_ERROR: Type undefined is not supported');
@@ -31,21 +34,22 @@ export function createTestDb(): ReminderDb & { raw: DatabaseSync } {
 				const result = raw.prepare(query).run(...params);
 				return { meta: { changes: Number(result.changes), last_row_id: Number(result.lastInsertRowid) } };
 			},
-			execute: () => raw.prepare(query).run(...params),
+			// D1 の batch と同じく、各文の結果 (RETURNING の行を含む) を返す
+			execute: () => ({ results: raw.prepare(query).all(...params) }),
 		};
 	};
 
 	return {
 		raw,
 		prepare: (query: string) => createStatement(query),
-		batch: async (statements: DbStatement[]) => {
+		batch: async <T>(statements: DbStatement[]) => {
 			raw.exec('BEGIN');
 			try {
 				const results = statements.map((statement) =>
 					(statement as ReturnType<typeof createStatement>).execute(),
 				);
 				raw.exec('COMMIT');
-				return results;
+				return results as { results: T[] }[];
 			} catch (error) {
 				raw.exec('ROLLBACK');
 				throw error;

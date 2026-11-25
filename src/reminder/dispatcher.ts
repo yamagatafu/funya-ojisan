@@ -8,13 +8,16 @@ import {
 	claimJob,
 	cleanupExpired,
 	closeOccurrenceStatement,
+	type ExtraCondition,
 	findDueJobs,
 	findRemindersWithoutSchedule,
+	getJob,
 	getOccurrence,
 	getReminder,
 	insertJobStatement,
 	insertOccurrence,
 	type JobRow,
+	jobOwnershipCondition,
 	listOpenOccurrences,
 	type OccurrenceRow,
 	type ReminderRow,
@@ -120,8 +123,26 @@ interface DispatchContext {
 	now: () => number;
 }
 
-async function finishJob(ctx: DispatchContext, job: JobRow, status: 'sent' | 'cancelled'): Promise<void> {
-	await updateJob(ctx.db, job.id, { status }, ctx.now());
+/**
+ * 確保したジョブ (locked_at は確保した時刻)。
+ * ジョブへの書き込みは、今もこの実行がロックを持っている場合だけ行う (ownership)。
+ */
+type ClaimedJob = JobRow & { locked_at: number };
+
+function owned(job: ClaimedJob): ExtraCondition {
+	return jobOwnershipCondition(job.id, job.locked_at);
+}
+
+/** 失敗時の状態の確定 (giveUp の batch) 自体が失敗したことを表す。状態は確定していないため、ジョブを再試行に回す */
+class StateTransitionError extends Error {
+	constructor(cause: unknown) {
+		super(`Failed to record the reminder job failure: ${String(cause)}`);
+		this.name = 'StateTransitionError';
+	}
+}
+
+async function finishJob(ctx: DispatchContext, job: ClaimedJob, status: 'sent' | 'cancelled'): Promise<void> {
+	await updateJob(ctx.db, job.id, { status }, ctx.now(), owned(job));
 }
 
 /**
@@ -129,11 +150,11 @@ async function finishJob(ctx: DispatchContext, job: JobRow, status: 'sent' | 'ca
  * - 恒久エラー、または本通知を諦める場合は、リマインダを error にして以降の送信を止める
  *   (有効なまま予定のないリマインダを残さず、/remind list で気付けるようにする)
  * - それ以外 (事前通知・再通知・スヌーズの一時的な失敗) は、そのジョブだけを failed にする
- * batch が失敗した場合は例外を投げる。呼び出し側はジョブを再試行できる状態に戻すこと。
+ * batch が失敗した場合は StateTransitionError を投げる。呼び出し側はジョブを再試行できる状態に戻すこと。
  */
 async function giveUp(
 	ctx: DispatchContext,
-	job: JobRow,
+	job: ClaimedJob,
 	params: { detail: string; disableReminder: boolean; occurrenceId: number | null },
 ): Promise<void> {
 	const now = ctx.now();
@@ -142,27 +163,37 @@ async function giveUp(
 	console.error(
 		`[ALERT] Reminder job given up${disable ? ' and reminder disabled' : ''}: jobId=${job.id}, reminderId=${job.reminder_id}, attempts=${attempts}, ${params.detail}`,
 	);
-	await ctx.db.batch(
-		compact([
-			updateJobStatement(ctx.db, job.id, { status: 'failed', attempt_count: attempts }, now),
-			disable
-				? updateReminderStatement(
-						ctx.db,
-						job.reminder_id,
-						{ status: 'error', last_error: params.detail.slice(0, 500), next_run_at: null },
-						now,
-					)
-				: null,
-			disable ? cancelPendingJobsStatement(ctx.db, { reminderId: job.reminder_id }, now) : null,
-			disable && params.occurrenceId !== null
-				? closeOccurrenceStatement(ctx.db, params.occurrenceId, 'superseded', { now })
-				: null,
-		]),
-	);
+	// ジョブの更新はロックを外すため最後に行う (先に行うと、所有権を条件にした以降の文が反映されない)
+	const statements = compact([
+		disable
+			? updateReminderStatement(
+					ctx.db,
+					job.reminder_id,
+					{ status: 'error', last_error: params.detail.slice(0, 500), next_run_at: null },
+					now,
+					owned(job),
+				)
+			: null,
+		disable ? cancelPendingJobsStatement(ctx.db, { reminderId: job.reminder_id }, now) : null,
+		disable && params.occurrenceId !== null
+			? closeOccurrenceStatement(ctx.db, params.occurrenceId, 'superseded', { now })
+			: null,
+		updateJobStatement(ctx.db, job.id, { status: 'failed', attempt_count: attempts }, now, owned(job)),
+	]);
+	try {
+		await ctx.db.batch(statements);
+	} catch (error) {
+		throw new StateTransitionError(error);
+	}
 }
 
 /** ジョブを再試行できる状態に戻す */
-async function retryLater(ctx: DispatchContext, job: JobRow, delayMs: number, countAttempt: boolean): Promise<void> {
+async function retryLater(
+	ctx: DispatchContext,
+	job: ClaimedJob,
+	delayMs: number,
+	countAttempt: boolean,
+): Promise<void> {
 	const now = ctx.now();
 	await updateJob(
 		ctx.db,
@@ -173,12 +204,13 @@ async function retryLater(ctx: DispatchContext, job: JobRow, delayMs: number, co
 			attempt_count: countAttempt ? job.attempt_count + 1 : job.attempt_count,
 		},
 		now,
+		owned(job),
 	);
 }
 
 async function handleSendFailure(
 	ctx: DispatchContext,
-	job: JobRow,
+	job: ClaimedJob,
 	outcome: Exclude<SendOutcome, { type: 'ok' }>,
 	occurrenceId: number | null,
 ): Promise<void> {
@@ -203,7 +235,7 @@ async function handleSendFailure(
 	}
 }
 
-async function processPreJob(ctx: DispatchContext, job: JobRow, reminder: ReminderRow): Promise<void> {
+async function processPreJob(ctx: DispatchContext, job: ClaimedJob, reminder: ReminderRow): Promise<void> {
 	if (reminder.status !== 'active' || ctx.now() >= job.scheduled_at) {
 		// 一時停止中、または本通知の時刻を過ぎた事前通知は送らない
 		await finishJob(ctx, job, 'cancelled');
@@ -243,6 +275,7 @@ function nagStatement(
 	reminder: ReminderRow,
 	occurrence: Pick<OccurrenceRow, 'id' | 'scheduled_at'>,
 	nagCount: number,
+	condition: ExtraCondition,
 ): DbStatement | null {
 	if (!reminder.nag_interval_minutes || nagCount >= (reminder.nag_max_count ?? 0)) {
 		return null;
@@ -258,6 +291,7 @@ function nagStatement(
 			scheduledAt: occurrence.scheduled_at,
 		},
 		now,
+		condition,
 	);
 }
 
@@ -291,7 +325,7 @@ function compact(statements: (DbStatement | null)[]): DbStatement[] {
 	return statements.filter((statement): statement is DbStatement => statement !== null);
 }
 
-async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: ReminderRow): Promise<void> {
+async function processMainJob(ctx: DispatchContext, job: ClaimedJob, reminder: ReminderRow): Promise<void> {
 	if (reminder.status !== 'active') {
 		await finishJob(ctx, job, 'cancelled');
 		return;
@@ -312,9 +346,10 @@ async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: Remin
 	}
 
 	if (!occurrence.last_message_id) {
+		// 再試行時も、回に記録したチャンネルに送る (記録と実際の送信先を一致させる)
 		const outcome = await postMessage(
 			ctx.rest,
-			reminder.channel_id,
+			occurrenceChannelId(occurrence, reminder),
 			buildNotification(reminder, {
 				kind: 'main',
 				occurrenceId: occurrence.id,
@@ -343,16 +378,18 @@ async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: Remin
 		Math.max(job.scheduled_at, now),
 		now,
 		{
-			guardUpdatedAt: reminder.updated_at,
+			guardRevision: reminder.revision,
+			// ロックが切れて別の実行に再取得されていた場合は、この実行の結果を書き込まない (次回ジョブの重複登録の防止)
+			condition: owned(job),
 			extraUpdate: remainingCount === null ? undefined : { remaining_count: remainingCount },
 		},
 	);
 	await ctx.db.batch(
 		compact([
 			...supersede.statements,
-			nagStatement(ctx, reminder, occurrence, occurrence.nag_count),
+			nagStatement(ctx, reminder, occurrence, occurrence.nag_count, owned(job)),
 			...upcoming.statements,
-			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now),
+			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now, owned(job)),
 		]),
 	);
 
@@ -361,7 +398,7 @@ async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: Remin
 	}
 }
 
-async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: ReminderRow): Promise<void> {
+async function processFollowUpJob(ctx: DispatchContext, job: ClaimedJob, reminder: ReminderRow): Promise<void> {
 	const occurrence = job.occurrence_id !== null ? await getOccurrence(ctx.db, job.occurrence_id) : null;
 	// error のリマインダ (送信先に投稿できない) には送らない。ended は開いている回の再通知が必要なため送る
 	if (occurrence?.state !== 'open' || reminder.status === 'error') {
@@ -406,8 +443,8 @@ async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: R
 	await ctx.db.batch(
 		compact([
 			updateOccurrenceStatement(ctx.db, occurrence.id, { last_message_id: messageId, nag_count: nagCount }),
-			nagStatement(ctx, reminder, occurrence, nagCount),
-			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now),
+			nagStatement(ctx, reminder, occurrence, nagCount, owned(job)),
+			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now, owned(job)),
 		]),
 	);
 
@@ -416,7 +453,7 @@ async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: R
 	}
 }
 
-async function processJob(ctx: DispatchContext, job: JobRow): Promise<void> {
+async function processJob(ctx: DispatchContext, job: ClaimedJob): Promise<void> {
 	const reminder = await getReminder(ctx.db, job.reminder_id);
 	if (!reminder) {
 		await finishJob(ctx, job, 'cancelled');
@@ -433,6 +470,31 @@ async function processJob(ctx: DispatchContext, job: JobRow): Promise<void> {
 	}
 }
 
+/** ジョブの処理中の想定外の例外を記録し、再試行に回すか諦める */
+async function handleUnexpectedError(ctx: DispatchContext, job: ClaimedJob, error: unknown): Promise<void> {
+	console.error(`Unexpected error while processing reminder job ${job.id}:`, error);
+	try {
+		// 失敗時の状態の確定 (giveUp) 自体が失敗した場合は、状態が確定していないため試行回数にかかわらず再試行する
+		if (!(error instanceof StateTransitionError) && job.attempt_count + 1 >= MAX_ATTEMPTS) {
+			// 本通知の処理中に作成した回も閉じられるよう、ジョブを読み直す
+			const current = await getJob(ctx.db, job.id);
+			await giveUp(ctx, job, {
+				detail: String(error),
+				disableReminder: false,
+				occurrenceId: current?.occurrence_id ?? job.occurrence_id,
+			});
+			return;
+		}
+		await retryLater(ctx, job, RETRY_DELAY_MS, true);
+	} catch (recordError) {
+		// 状態の確定に失敗した場合は、再試行できる状態に戻す (ロールバック済みのため不整合は残らない)
+		console.error('Failed to record job failure:', recordError);
+		await retryLater(ctx, job, RETRY_DELAY_MS, true).catch((retryError) =>
+			console.error('Failed to reschedule job:', retryError),
+		);
+	}
+}
+
 /** 自己修復の対象にする最終更新からの経過時間 (処理中の操作と競合しないよう十分に空ける) */
 const REPAIR_MIN_AGE_MS = 10 * MINUTE_MS;
 const REPAIR_BATCH_SIZE = 20;
@@ -445,7 +507,9 @@ async function repairMissingSchedules(ctx: DispatchContext): Promise<void> {
 	const now = ctx.now();
 	for (const reminder of await findRemindersWithoutSchedule(ctx.db, now, REPAIR_MIN_AGE_MS, REPAIR_BATCH_SIZE)) {
 		console.error(`[ALERT] Repairing reminder without a pending main job: reminderId=${reminder.id}`);
-		const { statements } = planUpcoming(ctx.db, reminder, now, now, { guardUpdatedAt: reminder.updated_at });
+		// 1 回のみで通知時刻を過ぎていても、未送信のまま終わらせずにすぐ送る (遅延の注記付き)
+		const afterMs = reminder.schedule_type === 'once' ? 0 : now;
+		const { statements } = planUpcoming(ctx.db, reminder, afterMs, now, { guardRevision: reminder.revision });
 		await ctx.db.batch(statements);
 	}
 }
@@ -463,28 +527,17 @@ export async function dispatchDueJobs(params: { db: ReminderDb; rest: Rest; now?
 			if (ctx.now() - startedAt >= EXECUTION_BUDGET_MS) {
 				break;
 			}
-			if (!(await claimJob(ctx.db, job.id, ctx.now()))) {
+			const claimedAt = ctx.now();
+			if (!(await claimJob(ctx.db, job.id, claimedAt))) {
 				continue;
 			}
+			const claimed: ClaimedJob = { ...job, status: 'processing', locked_at: claimedAt };
 			claimedAny = true;
 			processed++;
 			try {
-				await processJob(ctx, job);
+				await processJob(ctx, claimed);
 			} catch (error) {
-				console.error(`Unexpected error while processing reminder job ${job.id}:`, error);
-				try {
-					if (job.attempt_count + 1 >= MAX_ATTEMPTS) {
-						await giveUp(ctx, job, { detail: String(error), disableReminder: false, occurrenceId: null });
-					} else {
-						await retryLater(ctx, job, RETRY_DELAY_MS, true);
-					}
-				} catch (recordError) {
-					// 状態の確定に失敗した場合は、再試行できる状態に戻す (ロールバック済みのため不整合は残らない)
-					console.error('Failed to record job failure:', recordError);
-					await retryLater(ctx, job, RETRY_DELAY_MS, true).catch((retryError) =>
-						console.error('Failed to reschedule job:', retryError),
-					);
-				}
+				await handleUnexpectedError(ctx, claimed, error);
 			}
 		}
 		if (!claimedAny || jobs.length < BATCH_SIZE) {

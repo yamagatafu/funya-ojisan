@@ -1,7 +1,9 @@
 import type { DbStatement, ReminderDb } from '../types.ts';
 import { MINUTE_MS } from './date.ts';
 import {
+	allConditions,
 	cancelPendingJobsStatement,
+	type ExtraCondition,
 	guardCondition,
 	insertJobStatement,
 	type ReminderRow,
@@ -27,10 +29,12 @@ export function reminderToSchedule(reminder: ReminderRow): Schedule {
 
 export interface PlanOptions {
 	/**
-	 * 指定すると、リマインダが有効で updated_at がこの値と一致する場合だけ反映する
+	 * 指定すると、リマインダが有効で revision がこの値と一致する場合だけ反映する
 	 * (一時停止・編集など、読み取り後の変更と競合した場合は何もしない)
 	 */
-	guardUpdatedAt?: number;
+	guardRevision?: number;
+	/** すべての文に追加する条件 (ジョブのロックの所有権など) */
+	condition?: ExtraCondition;
 	/** 次回の予定と同じ UPDATE 文で更新する項目 (残り回数など) */
 	extraUpdate?: ReminderUpdate;
 }
@@ -39,7 +43,7 @@ export interface PlanOptions {
  * afterMs より後の次回の本通知 (と事前通知) のジョブを登録し、next_run_at を更新する SQL 文を組み立てる。
  * 次回がなければリマインダを ended にする文を返す。
  * 他の更新と同じ batch (トランザクション) で実行できるよう、実行はしない。
- * ジョブの登録を先に、リマインダの更新 (updated_at が変わる) を最後に行う。
+ * ジョブの登録を先に、リマインダの更新 (revision が変わる) を最後に行う。
  */
 export function planUpcoming(
 	db: ReminderDb,
@@ -48,10 +52,12 @@ export function planUpcoming(
 	now: number,
 	options: PlanOptions = {},
 ): { occurrence: Occurrence | null; statements: DbStatement[] } {
-	const condition =
-		options.guardUpdatedAt === undefined
+	const condition = allConditions(
+		options.guardRevision === undefined
 			? undefined
-			: guardCondition({ reminderId: reminder.id, updatedAt: options.guardUpdatedAt });
+			: guardCondition({ reminderId: reminder.id, revision: options.guardRevision }),
+		options.condition,
+	);
 	const occurrence = computeNextOccurrence(reminderToSchedule(reminder), afterMs);
 	if (!occurrence) {
 		return {
