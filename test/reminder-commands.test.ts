@@ -717,8 +717,10 @@ describe('/remind delete', () => {
 	it('removes buttons from open notifications', async () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
-		const occurrenceId = await insertOccurrence(db, reminder.id, NOW);
+		const occurrenceId = await insertOccurrence(db, reminder.id, NOW, reminder.channel_id);
 		await updateOccurrence(db, occurrenceId, { last_message_id: 'msg-1' });
+		// 通知の送信後に通知先を変更しても、ボタンは送信したチャンネルで外す
+		db.raw.exec(`UPDATE reminders SET channel_id = '${OTHER_CHANNEL_ID}' WHERE id = ${reminder.id}`);
 		const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({}));
 
 		const body = await send(db, commandInteraction('delete', [opt('id', reminder.id)]));
@@ -882,10 +884,13 @@ describe('atomicity', () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
 		const before = jobs(db, reminder.id);
-		vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
 
-		await run(db, 'edit', [opt('id', reminder.id), opt('time', '10:00')]).catch(() => undefined);
+		const batchSpy = vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
 
+		expect(await run(db, 'edit', [opt('id', reminder.id), opt('time', '10:00')])).toBe(
+			'エラーが発生しました。時間をおいて再度お試しください。',
+		);
+		expect(batchSpy).toHaveBeenCalledTimes(1);
 		expect(jobs(db, reminder.id)).toEqual(before);
 		expect(await getReminder(db, reminder.id)).toEqual(reminder);
 	});
@@ -894,11 +899,109 @@ describe('atomicity', () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
 		await run(db, 'pause', [opt('id', reminder.id)]);
-		vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
+		const batchSpy = vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
 
-		await run(db, 'resume', [opt('id', reminder.id)]).catch(() => undefined);
+		expect(await run(db, 'resume', [opt('id', reminder.id)])).toBe(
+			'エラーが発生しました。時間をおいて再度お試しください。',
+		);
+		expect(batchSpy).toHaveBeenCalledTimes(1);
 
 		expect((await getReminder(db, reminder.id))?.status).toBe('paused');
 		expect(jobs(db, reminder.id).filter((job) => job.status === 'pending')).toHaveLength(0);
+	});
+
+	it('enforces the limit when reviving an ended reminder even if a registration races', async () => {
+		const db = createTestDb();
+		const ended = await seed(db);
+		db.raw.exec(`UPDATE reminders SET status = 'ended', next_run_at = NULL WHERE id = ${ended.id}`);
+		db.raw.exec("UPDATE reminder_jobs SET status = 'cancelled'");
+		for (let i = 0; i < 24; i++) {
+			await seed(db);
+		}
+		const batch = db.batch.bind(db);
+		// 事前確認の後、batch の前に別の登録が入った状況を再現する
+		vi.spyOn(db, 'batch').mockImplementationOnce(async (statements) => {
+			await seed(db);
+			return batch(statements);
+		});
+
+		const content = await run(db, 'edit', [opt('id', ended.id), opt('time', '10:00')]);
+
+		expect(content).toContain('上限に達しているため');
+		expect((await getReminder(db, ended.id))?.status).toBe('ended');
+		expect(jobs(db, ended.id).filter((job) => job.status === 'pending')).toHaveLength(0);
+	});
+
+	it('does not schedule a reminder that was paused right after being registered', async () => {
+		const db = createTestDb();
+		const batch = db.batch.bind(db);
+		vi.spyOn(db, 'batch').mockImplementationOnce(async (statements) => {
+			// 登録の確定後、最初の予定を登録する前に一時停止された状況を再現する
+			db.raw.exec(`UPDATE reminders SET status = 'paused', next_run_at = NULL, updated_at = ${NOW + 1}`);
+			return batch(statements);
+		});
+
+		await createReminder(db, input(), NOW);
+
+		expect(reminders(db)).toMatchObject([{ status: 'paused', next_run_at: null }]);
+		expect(jobs(db)).toHaveLength(0);
+	});
+});
+
+describe('permission checks on the current target', () => {
+	it('asks to run edit in the target channel or to specify a channel', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db);
+		expect(
+			await run(db, 'edit', [opt('id', reminder.id), opt('content', '変更')], { channelId: OTHER_CHANNEL_ID }),
+		).toContain('channel オプションで通知先を指定してください');
+		expect((await getReminder(db, reminder.id))?.content).toBe(reminder.content);
+	});
+
+	it('rejects edit and resume when the actor can no longer post to the target', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db);
+		await run(db, 'pause', [opt('id', reminder.id)]);
+
+		expect(
+			await run(db, 'edit', [opt('id', reminder.id), opt('content', '変更')], {
+				permissions: VIEW_ONLY_PERMISSIONS,
+			}),
+		).toContain('投稿する権限がない');
+		expect(await run(db, 'resume', [opt('id', reminder.id)], { permissions: VIEW_ONLY_PERMISSIONS })).toContain(
+			'投稿する権限がない',
+		);
+		expect((await getReminder(db, reminder.id))?.status).toBe('paused');
+	});
+
+	it('asks to run resume in the target channel', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db);
+		await run(db, 'pause', [opt('id', reminder.id)]);
+		expect(await run(db, 'resume', [opt('id', reminder.id)], { channelId: OTHER_CHANNEL_ID })).toContain(
+			'通知先のチャンネルで実行してください',
+		);
+		expect((await getReminder(db, reminder.id))?.status).toBe('paused');
+	});
+
+	it('re-validates a stored role mention when only the channel changes', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db, { mention_type: 'role', mention_target_id: ROLE_ID });
+		const resolved = {
+			channels: { [OTHER_CHANNEL_ID]: { id: OTHER_CHANNEL_ID, type: 0, permissions: MEMBER_PERMISSIONS } },
+		};
+		expect(await run(db, 'edit', [opt('id', reminder.id), channelOpt(OTHER_CHANNEL_ID)], { resolved })).toContain(
+			'mention でロールを指定し直してください',
+		);
+		expect((await getReminder(db, reminder.id))?.channel_id).toBe(CHANNEL_ID);
+
+		const allowed = {
+			channels: {
+				[OTHER_CHANNEL_ID]: { id: OTHER_CHANNEL_ID, type: 0, permissions: MENTION_EVERYONE_PERMISSIONS },
+			},
+		};
+		expect(
+			await run(db, 'edit', [opt('id', reminder.id), channelOpt(OTHER_CHANNEL_ID)], { resolved: allowed }),
+		).toContain('を更新しました');
 	});
 });

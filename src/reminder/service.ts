@@ -192,7 +192,8 @@ export async function createReminder(db: ReminderDb, input: ReminderInput, now: 
 		if (!reminder) {
 			throw new Error(`Reminder ${id} disappeared`);
 		}
-		const occurrence = await scheduleUpcoming(db, reminder, now, now);
+		// 登録直後に一時停止・編集された場合は、その操作を優先して予定を登録しない
+		const occurrence = await scheduleUpcoming(db, reminder, now, now, { guardUpdatedAt: reminder.updated_at });
 		if (!occurrence) {
 			throw new Error(`Reminder ${id} has no occurrence`);
 		}

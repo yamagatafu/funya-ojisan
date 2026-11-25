@@ -121,6 +121,17 @@ export async function insertReminder(db: ReminderDb, input: ReminderInput, now: 
 	return row.id;
 }
 
+/** 件数の上限 (登録・復活時) を満たすことを表す条件。終了済み (ended) のリマインダは数えない */
+export function withinLimitsCondition(
+	params: { guildId: string; ownerId: string },
+	limits: { perUser: number; perGuild: number },
+): ExtraCondition {
+	return {
+		sql: "(SELECT COUNT(*) FROM reminders WHERE guild_id = ? AND owner_id = ? AND status != 'ended') < ? AND (SELECT COUNT(*) FROM reminders WHERE guild_id = ? AND status != 'ended') < ?",
+		values: [params.guildId, params.ownerId, limits.perUser, params.guildId, limits.perGuild],
+	};
+}
+
 /**
  * 件数の上限を満たす場合だけ登録する。上限に達していれば null。
  * 件数の確認と登録を 1 つの SQL 文で行うため、同時に実行されても上限を超えない。

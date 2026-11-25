@@ -1,4 +1,9 @@
-import type { APIAllowedMentions, APIInteractionDataResolved, APIInteractionGuildMember } from 'discord-api-types/v10';
+import {
+	type APIAllowedMentions,
+	type APIInteractionDataResolved,
+	type APIInteractionGuildMember,
+	PermissionFlagsBits,
+} from 'discord-api-types/v10';
 import {
 	makeBooleanOption,
 	makeChannelOption,
@@ -28,13 +33,16 @@ import {
 } from '../reminder/options.ts';
 import {
 	type ActingMember,
+	type CheckResult,
 	canManageReminder,
 	checkChannelTarget,
 	checkCreationLimits,
 	checkMention,
+	hasPermission,
 	isModerator,
 	MAX_CONTENT_LENGTH,
 	MAX_REMINDERS_PER_GUILD,
+	MAX_REMINDERS_PER_USER,
 	REMINDER_CHANNEL_TYPES,
 	resolveChannelTarget,
 } from '../reminder/permissions.ts';
@@ -48,6 +56,7 @@ import {
 	type ReminderRow,
 	type ReminderUpdate,
 	updateReminderStatement,
+	withinLimitsCondition,
 } from '../reminder/repository.ts';
 import { computeNextOccurrence, HOLIDAY_POLICIES, SCHEDULE_TYPES } from '../reminder/schedule.ts';
 import { cancelUpcomingStatement, createReminder, planUpcoming, reminderToSchedule } from '../reminder/service.ts';
@@ -315,6 +324,31 @@ async function handleIn(inv: Invocation): Promise<Reply> {
 	return register(inv, inv.opts.content, schedule.value);
 }
 
+/**
+ * 実行者が今の通知先に投稿できるかを確認する (通知先を変えない編集・再開)。
+ * 実行者の権限は実行したチャンネルの分しか分からないため、通知先以外で実行された場合は案内を返す
+ */
+function checkCurrentTarget(inv: Invocation, reminder: ReminderRow, action: 'edit' | 'resume'): CheckResult {
+	if (reminder.channel_id !== inv.channelId) {
+		return {
+			ok: false,
+			message:
+				action === 'edit'
+					? `通知先 <#${reminder.channel_id}> への投稿権限を確認するため、通知先のチャンネルで実行するか、channel オプションで通知先を指定してください。`
+					: `通知先 <#${reminder.channel_id}> への投稿権限を確認するため、通知先のチャンネルで実行してください。`,
+		};
+	}
+	const target = resolveChannelTarget({
+		optionChannelId: undefined,
+		resolvedChannels: undefined,
+		interactionChannelId: inv.channelId,
+		interactionChannelType: inv.channelType,
+		memberPermissions: inv.actor.permissions,
+		appPermissions: inv.appPermissions,
+	});
+	return target ? checkChannelTarget(target) : { ok: false, message: '通知先のチャンネルを特定できませんでした。' };
+}
+
 async function handleEdit(inv: Invocation): Promise<Reply> {
 	const reminder = await findManageableReminder(inv);
 	if (!reminder) {
@@ -340,9 +374,16 @@ async function handleEdit(inv: Invocation): Promise<Reply> {
 		update.content = content.value;
 	}
 
-	let targetPermissions: string | undefined =
-		reminder.channel_id === inv.channelId ? inv.actor.permissions : undefined;
-	if (inv.opts.channel !== undefined) {
+	let targetPermissions: string | undefined;
+	if (inv.opts.channel === undefined) {
+		// 通知先を変えない場合も、実行者が今の通知先に投稿できることを確認する。
+		// 実行者の権限は実行したチャンネルの分しか分からないため、通知先以外からは通知先の指定を求める
+		const check = checkCurrentTarget(inv, reminder, 'edit');
+		if (!check.ok) {
+			return check.message;
+		}
+		targetPermissions = inv.actor.permissions;
+	} else {
 		const target = resolveChannelTarget({
 			optionChannelId: inv.opts.channel,
 			resolvedChannels: inv.resolved?.channels,
@@ -360,6 +401,17 @@ async function handleEdit(inv: Invocation): Promise<Reply> {
 		}
 		update.channel_id = target.channelId;
 		targetPermissions = target.memberPermissions;
+
+		// 通知先を変える場合は、引き継ぐロールメンションを変更先の権限で確認し直す
+		// (ロールがメンション可能かは再指定されない限り分からないため、MENTION_EVERYONE を求める)
+		if (
+			inv.opts.mention === undefined &&
+			reminder.mention_type === 'role' &&
+			target.channelId !== reminder.channel_id &&
+			!hasPermission(targetPermissions, PermissionFlagsBits.MentionEveryone)
+		) {
+			return 'ロールへのメンションを新しい通知先に引き継ぐには、mention でロールを指定し直してください。';
+		}
 	}
 
 	if (inv.opts.mention !== undefined) {
@@ -399,15 +451,37 @@ async function handleEdit(inv: Invocation): Promise<Reply> {
 		update.next_run_at = null;
 	}
 
-	// 予定の取り消し・内容の更新・次回予定の登録は 1 つの batch で行い、途中で失敗しても予定が消えないようにする
+	// 予定の取り消し・内容の更新・次回予定の登録は 1 つの batch で行い、途中で失敗しても予定が消えないようにする。
+	// 終了済みからの復活は、件数の上限を UPDATE の条件に含める (確認と更新の間に登録が入っても上限を超えない)。
+	// 次回予定は、この UPDATE が反映された (updated_at が今回の時刻になった) 場合だけ登録する
+	const reviving = reminder.status === 'ended';
 	await inv.db.batch([
 		cancelUpcomingStatement(inv.db, reminder.id, inv.now),
-		...compact([updateReminderStatement(inv.db, reminder.id, update, inv.now)]),
-		...(paused ? [] : planUpcoming(inv.db, { ...merged, ...update }, inv.now, inv.now).statements),
+		...compact([
+			updateReminderStatement(
+				inv.db,
+				reminder.id,
+				update,
+				inv.now,
+				reviving
+					? withinLimitsCondition(
+							{ guildId: reminder.guild_id, ownerId: reminder.owner_id },
+							{ perUser: MAX_REMINDERS_PER_USER, perGuild: MAX_REMINDERS_PER_GUILD },
+						)
+					: undefined,
+			),
+		]),
+		...(paused
+			? []
+			: planUpcoming(inv.db, { ...merged, ...update }, inv.now, inv.now, { guardUpdatedAt: inv.now }).statements),
 	]);
 	const saved = await getReminder(inv.db, reminder.id);
 	if (!saved) {
 		return notFound(reminder.id);
+	}
+	if (reviving && saved.status === 'ended') {
+		// 件数の条件を満たさず、UPDATE が反映されなかった
+		return `登録できるリマインダの上限に達しているため、リマインダ #${reminder.id} を再開できませんでした。不要なものを /remind delete で削除してください。`;
 	}
 	return buildReminderSummary(saved, `✏️ リマインダ #${reminder.id} を更新しました`);
 }
@@ -466,9 +540,13 @@ async function handleDelete(inv: Invocation): Promise<Reply> {
 	if (!reminder) {
 		return notFound(inv.opts.id);
 	}
+	// ボタンは、その回の通知を送ったチャンネルで外す (通知先を変更した後でも元のメッセージを対象にする)
 	const messages = (await listOpenOccurrences(inv.db, reminder.id))
-		.map((occurrence) => occurrence.last_message_id)
-		.filter((id): id is string => id !== null);
+		.filter((occurrence) => occurrence.last_message_id !== null)
+		.map((occurrence) => ({
+			channelId: occurrence.channel_id ?? reminder.channel_id,
+			messageId: occurrence.last_message_id,
+		}));
 	// ジョブ・通知の記録は外部キーで一緒に削除される
 	await deleteReminder(inv.db, reminder.id);
 	const message = `🗑️ リマインダ #${reminder.id} を削除しました。`;
@@ -477,8 +555,8 @@ async function handleDelete(inv: Invocation): Promise<Reply> {
 	}
 	return {
 		deferred: async (rest) => {
-			for (const messageId of messages) {
-				await removeButtons(rest, reminder.channel_id, messageId);
+			for (const { channelId, messageId } of messages) {
+				await removeButtons(rest, channelId, messageId);
 			}
 			return message;
 		},
@@ -509,6 +587,11 @@ async function handleResume(inv: Invocation): Promise<Reply> {
 	if (reminder.status !== 'paused' && reminder.status !== 'error') {
 		return `リマインダ #${reminder.id} は再開できません（現在: ${statusLabel(reminder)}）。`;
 	}
+	// 再開すると Bot が通知先に投稿するため、実行者が通知先に投稿できることを確認する
+	const check = checkCurrentTarget(inv, reminder, 'resume');
+	if (!check.ok) {
+		return check.message;
+	}
 	// エラー状態から再開する場合に、残っている予定と重複しないようにする
 	// 予定の取り消し・状態の更新・次回予定の登録は 1 つの batch で行い、途中で失敗しても状態が食い違わないようにする
 	const { occurrence, statements } = planUpcoming(
@@ -516,6 +599,7 @@ async function handleResume(inv: Invocation): Promise<Reply> {
 		{ ...reminder, status: 'active', last_error: null },
 		inv.now,
 		inv.now,
+		{ guardUpdatedAt: inv.now },
 	);
 	await inv.db.batch([
 		cancelUpcomingStatement(inv.db, reminder.id, inv.now),
