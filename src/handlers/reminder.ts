@@ -3,6 +3,7 @@ import { dispatchDueJobs } from '../reminder/dispatcher.ts';
 import { reminderActionHandlers } from './reminder-actions.ts';
 import { reminderCommandHandlers } from './reminder-commands.ts';
 import { reminderContextMenuHandlers } from './reminder-context-menu.ts';
+import { reminderGuiBaseHandlers } from './reminder-gui-base.ts';
 
 export const REMINDER_CRON = '* * * * *';
 
@@ -19,4 +20,5 @@ export const reminderHandlers = [
 	...reminderCommandHandlers,
 	...reminderActionHandlers,
 	...reminderContextMenuHandlers,
+	...reminderGuiBaseHandlers,
 ];
