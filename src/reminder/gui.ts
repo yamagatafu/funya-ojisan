@@ -176,7 +176,7 @@ export function reminderToBaseDefaults(reminder: ReminderRow): BaseModalDefaults
 	};
 }
 
-function label(text: string, component: APIComponentInLabel, description?: string): APILabelComponent {
+export function label(text: string, component: APIComponentInLabel, description?: string): APILabelComponent {
 	return { type: ComponentType.Label, label: text, ...(description ? { description } : {}), component };
 }
 
@@ -317,12 +317,12 @@ export interface BaseModalValues {
 	schedule: ScheduleOptionValues;
 }
 
-function stringValue(vars: Readonly<Record<string, unknown>>, name: string): string | undefined {
+export function stringValue(vars: Readonly<Record<string, unknown>>, name: string): string | undefined {
 	const value = vars[name];
 	return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
-function arrayValue(vars: Readonly<Record<string, unknown>>, name: string): string[] {
+export function arrayValue(vars: Readonly<Record<string, unknown>>, name: string): string[] {
 	const value = vars[name];
 	return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
@@ -337,7 +337,7 @@ function weekdaysToText(values: string[]): string | undefined {
 }
 
 /** 整数のテキスト入力を数値に変換する。空欄は undefined、整数でなければ NaN (検証でエラーにする) */
-function integerText(value: string | undefined): number | undefined {
+export function integerText(value: string | undefined): number | undefined {
 	if (value === undefined) {
 		return undefined;
 	}
