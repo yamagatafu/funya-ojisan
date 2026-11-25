@@ -4,6 +4,8 @@ import {
 	type APIComponentInMessageActionRow,
 	type APIInteractionDataResolved,
 	type APIInteractionGuildMember,
+	type APIStringSelectComponent,
+	ComponentType,
 	PermissionFlagsBits,
 } from 'discord-api-types/v10';
 import {
@@ -19,7 +21,7 @@ import { factory } from '../factory.ts';
 import type { Rest } from '../reminder/dispatcher.ts';
 import { removeButtons } from '../reminder/dispatcher.ts';
 import { describeSchedule, discordTimestamp, truncate } from '../reminder/format.ts';
-import { buildDetailButtons, buildRepeatSelect, NEW_REPEAT_SELECT_ID } from '../reminder/gui.ts';
+import { buildDetailButtons, buildRepeatSelect, MANAGE_SELECT_ID, NEW_REPEAT_SELECT_ID } from '../reminder/gui.ts';
 import { buildReminderSummary, statusLabel } from '../reminder/message.ts';
 import {
 	buildScheduleForAdd,
@@ -627,7 +629,29 @@ export async function handleList(inv: Invocation): Promise<Reply> {
 	if (total > shown) {
 		lines.push(`他 ${total - shown} 件`);
 	}
-	return lines.join('\n');
+	const listed = reminders.slice(0, shown);
+	if (listed.length === 0) {
+		return lines.join('\n');
+	}
+	return { message: { content: lines.join('\n'), components: [buildManageSelect(listed)] } };
+}
+
+/** 一覧の下に付ける「操作するリマインダ」の選択メニュー (一覧に表示したものだけ。最大 25 件) */
+function buildManageSelect(reminders: ReminderRow[]): APIActionRowComponent<APIStringSelectComponent> {
+	return {
+		type: ComponentType.ActionRow,
+		components: [
+			{
+				type: ComponentType.StringSelect,
+				custom_id: MANAGE_SELECT_ID,
+				placeholder: '操作するリマインダを選ぶ',
+				options: reminders.slice(0, LIST_LIMIT).map((reminder) => ({
+					label: autocompleteName(reminder),
+					value: String(reminder.id),
+				})),
+			},
+		],
+	};
 }
 
 export async function handleDelete(inv: Invocation): Promise<Reply> {
