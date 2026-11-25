@@ -121,6 +121,30 @@ export async function insertReminder(db: ReminderDb, input: ReminderInput, now: 
 	return row.id;
 }
 
+/**
+ * 件数の上限を満たす場合だけ登録する。上限に達していれば null。
+ * 件数の確認と登録を 1 つの SQL 文で行うため、同時に実行されても上限を超えない。
+ */
+export async function insertReminderWithinLimits(
+	db: ReminderDb,
+	input: ReminderInput,
+	limits: { perUser: number; perGuild: number },
+	now: number,
+): Promise<number | null> {
+	const columns = [...REMINDER_INPUT_COLUMNS, 'status', 'created_at', 'updated_at'];
+	const values = [...REMINDER_INPUT_COLUMNS.map((column) => input[column]), 'active', now, now];
+	const row = await db
+		.prepare(
+			`INSERT INTO reminders (${columns.join(', ')}) SELECT ${columns.map(() => '?').join(', ')}
+			WHERE (SELECT COUNT(*) FROM reminders WHERE guild_id = ? AND owner_id = ? AND status != 'ended') < ?
+			AND (SELECT COUNT(*) FROM reminders WHERE guild_id = ? AND status != 'ended') < ?
+			RETURNING id`,
+		)
+		.bind(...values, input.guild_id, input.owner_id, limits.perUser, input.guild_id, limits.perGuild)
+		.first<{ id: number }>();
+	return row?.id ?? null;
+}
+
 export function getReminder(db: ReminderDb, id: number): Promise<ReminderRow | null> {
 	return db.prepare('SELECT * FROM reminders WHERE id = ?').bind(id).first<ReminderRow>();
 }

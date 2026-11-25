@@ -6,13 +6,14 @@ import { buildScheduleForAdd, buildScheduleForEdit } from '../src/reminder/optio
 import {
 	getReminder,
 	insertOccurrence,
+	insertReminder,
 	type JobRow,
 	type ReminderInput,
 	type ReminderRow,
 	updateOccurrence,
 	updateReminder,
 } from '../src/reminder/repository.ts';
-import { createReminder } from '../src/reminder/service.ts';
+import { createReminder, scheduleUpcoming } from '../src/reminder/service.ts';
 import { createTestDb } from './helpers/d1.ts';
 import {
 	APPLICATION_ID,
@@ -154,12 +155,11 @@ function input(overrides: Partial<ReminderInput> = {}): ReminderInput {
 	};
 }
 
+/** 件数の上限を経由せずに登録する (上限を超える件数を用意するテスト用) */
 async function seed(db: TestDb, overrides: Partial<ReminderInput> = {}): Promise<ReminderRow> {
-	const result = await createReminder(db, input(overrides), NOW);
-	if (!result.ok) {
-		throw new Error(result.message);
-	}
-	return result.reminder;
+	const id = await insertReminder(db, input(overrides), NOW);
+	await scheduleUpcoming(db, (await getReminder(db, id))!, NOW, NOW);
+	return (await getReminder(db, id))!;
 }
 
 beforeEach(() => {
@@ -856,5 +856,49 @@ describe('schedule options', () => {
 			value: { schedule_type: 'monthly_nth_weekday', weekdays_mask: 0b100, nth_week: 2 },
 		});
 		expect(buildScheduleForEdit(added.value, { nag_interval: 3 }, NOW)).toMatchObject({ ok: false });
+	});
+});
+
+describe('atomicity', () => {
+	it('enforces the per-user limit inside the insert itself', async () => {
+		const db = createTestDb();
+		for (let i = 0; i < 25; i++) {
+			await seed(db);
+		}
+		const result = await createReminder(db, input(), NOW);
+		expect(result).toMatchObject({ ok: false });
+		expect(reminders(db)).toHaveLength(25);
+	});
+
+	it('rolls back the reminder when scheduling its first job fails', async () => {
+		const db = createTestDb();
+		vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
+		await expect(createReminder(db, input(), NOW)).rejects.toThrow('D1 unavailable');
+		expect(reminders(db)).toHaveLength(0);
+		expect(jobs(db)).toHaveLength(0);
+	});
+
+	it('keeps the existing schedule when an edit fails midway', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db);
+		const before = jobs(db, reminder.id);
+		vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
+
+		await run(db, 'edit', [opt('id', reminder.id), opt('time', '10:00')]).catch(() => undefined);
+
+		expect(jobs(db, reminder.id)).toEqual(before);
+		expect(await getReminder(db, reminder.id)).toEqual(reminder);
+	});
+
+	it('keeps the paused state when a resume fails midway', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db);
+		await run(db, 'pause', [opt('id', reminder.id)]);
+		vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
+
+		await run(db, 'resume', [opt('id', reminder.id)]).catch(() => undefined);
+
+		expect((await getReminder(db, reminder.id))?.status).toBe('paused');
+		expect(jobs(db, reminder.id).filter((job) => job.status === 'pending')).toHaveLength(0);
 	});
 });

@@ -1,13 +1,15 @@
 import type { DbStatement, ReminderDb } from '../types.ts';
 import { MINUTE_MS } from './date.ts';
+import { MAX_REMINDERS_PER_GUILD, MAX_REMINDERS_PER_USER } from './permissions.ts';
 import {
 	allConditions,
 	cancelPendingJobsStatement,
 	type ExtraCondition,
+	deleteReminder,
 	getReminder,
 	guardCondition,
 	insertJobStatement,
-	insertReminder,
+	insertReminderWithinLimits,
 	type ReminderInput,
 	type ReminderRow,
 	type ReminderUpdate,
@@ -172,14 +174,34 @@ export async function createReminder(db: ReminderDb, input: ReminderInput, now: 
 		return { ok: false, message: '条件に合う通知日時がありません。日時・繰り返し・終了日を確認してください。' };
 	}
 
-	const id = await insertReminder(db, input, now);
-	const reminder = await getReminder(db, id);
-	if (!reminder) {
-		throw new Error(`Reminder ${id} disappeared`);
+	const id = await insertReminderWithinLimits(
+		db,
+		input,
+		{ perUser: MAX_REMINDERS_PER_USER, perGuild: MAX_REMINDERS_PER_GUILD },
+		now,
+	);
+	if (id === null) {
+		return {
+			ok: false,
+			message: '登録できるリマインダの上限に達しています。不要なものを /remind delete で削除してください。',
+		};
 	}
-	const occurrence = await scheduleUpcoming(db, reminder, now, now);
-	if (!occurrence) {
-		throw new Error(`Reminder ${id} has no occurrence`);
+
+	try {
+		const reminder = await getReminder(db, id);
+		if (!reminder) {
+			throw new Error(`Reminder ${id} disappeared`);
+		}
+		const occurrence = await scheduleUpcoming(db, reminder, now, now);
+		if (!occurrence) {
+			throw new Error(`Reminder ${id} has no occurrence`);
+		}
+		return { ok: true, reminder: { ...reminder, next_run_at: occurrence.runAt }, occurrence };
+	} catch (error) {
+		// 通知ジョブのない有効なリマインダが残らないよう、登録を取り消す
+		await deleteReminder(db, id).catch((deleteError) =>
+			console.error(`Failed to roll back reminder ${id}:`, deleteError),
+		);
+		throw error;
 	}
-	return { ok: true, reminder: { ...reminder, next_run_at: occurrence.runAt }, occurrence };
 }

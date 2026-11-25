@@ -47,10 +47,16 @@ import {
 	type ReminderInput,
 	type ReminderRow,
 	type ReminderUpdate,
-	updateReminder,
+	updateReminderStatement,
 } from '../reminder/repository.ts';
 import { computeNextOccurrence, HOLIDAY_POLICIES, SCHEDULE_TYPES } from '../reminder/schedule.ts';
-import { cancelUpcoming, createReminder, reminderToSchedule, scheduleUpcoming } from '../reminder/service.ts';
+import { cancelUpcomingStatement, createReminder, planUpcoming, reminderToSchedule } from '../reminder/service.ts';
+import type { DbStatement } from '../types.ts';
+
+function compact(statements: (DbStatement | null)[]): DbStatement[] {
+	return statements.filter((statement): statement is DbStatement => statement !== null);
+}
+
 import type { ReminderDb } from '../types.ts';
 
 /** 一覧に表示する最大件数 */
@@ -393,15 +399,15 @@ async function handleEdit(inv: Invocation): Promise<Reply> {
 		update.next_run_at = null;
 	}
 
-	await cancelUpcoming(inv.db, reminder.id, inv.now);
-	await updateReminder(inv.db, reminder.id, update, inv.now);
-	let saved = await getReminder(inv.db, reminder.id);
+	// 予定の取り消し・内容の更新・次回予定の登録は 1 つの batch で行い、途中で失敗しても予定が消えないようにする
+	await inv.db.batch([
+		cancelUpcomingStatement(inv.db, reminder.id, inv.now),
+		...compact([updateReminderStatement(inv.db, reminder.id, update, inv.now)]),
+		...(paused ? [] : planUpcoming(inv.db, { ...merged, ...update }, inv.now, inv.now).statements),
+	]);
+	const saved = await getReminder(inv.db, reminder.id);
 	if (!saved) {
 		return notFound(reminder.id);
-	}
-	if (!paused) {
-		await scheduleUpcoming(inv.db, saved, inv.now, inv.now);
-		saved = (await getReminder(inv.db, reminder.id)) ?? saved;
 	}
 	return buildReminderSummary(saved, `✏️ リマインダ #${reminder.id} を更新しました`);
 }
@@ -487,8 +493,10 @@ async function handlePause(inv: Invocation): Promise<Reply> {
 	if (reminder.status !== 'active' && reminder.status !== 'error') {
 		return `リマインダ #${reminder.id} は一時停止できません（現在: ${statusLabel(reminder)}）。`;
 	}
-	await cancelUpcoming(inv.db, reminder.id, inv.now);
-	await updateReminder(inv.db, reminder.id, { status: 'paused', next_run_at: null }, inv.now);
+	await inv.db.batch([
+		cancelUpcomingStatement(inv.db, reminder.id, inv.now),
+		...compact([updateReminderStatement(inv.db, reminder.id, { status: 'paused', next_run_at: null }, inv.now)]),
+	]);
 	const saved = (await getReminder(inv.db, reminder.id)) ?? reminder;
 	return buildReminderSummary(saved, `⏸️ リマインダ #${reminder.id} を一時停止しました`);
 }
@@ -502,14 +510,18 @@ async function handleResume(inv: Invocation): Promise<Reply> {
 		return `リマインダ #${reminder.id} は再開できません（現在: ${statusLabel(reminder)}）。`;
 	}
 	// エラー状態から再開する場合に、残っている予定と重複しないようにする
-	await cancelUpcoming(inv.db, reminder.id, inv.now);
-	await updateReminder(inv.db, reminder.id, { status: 'active', last_error: null }, inv.now);
-	const occurrence = await scheduleUpcoming(
+	// 予定の取り消し・状態の更新・次回予定の登録は 1 つの batch で行い、途中で失敗しても状態が食い違わないようにする
+	const { occurrence, statements } = planUpcoming(
 		inv.db,
 		{ ...reminder, status: 'active', last_error: null },
 		inv.now,
 		inv.now,
 	);
+	await inv.db.batch([
+		cancelUpcomingStatement(inv.db, reminder.id, inv.now),
+		...compact([updateReminderStatement(inv.db, reminder.id, { status: 'active', last_error: null }, inv.now)]),
+		...statements,
+	]);
 	const saved = (await getReminder(inv.db, reminder.id)) ?? reminder;
 	if (!occurrence) {
 		return buildReminderSummary(
