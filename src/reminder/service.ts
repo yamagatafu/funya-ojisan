@@ -5,11 +5,10 @@ import {
 	allConditions,
 	cancelPendingJobsStatement,
 	type ExtraCondition,
-	deleteReminder,
 	getReminder,
 	guardCondition,
 	insertJobStatement,
-	insertReminderWithinLimits,
+	insertReminderWithFirstJobsStatements,
 	type ReminderInput,
 	type ReminderRow,
 	type ReminderUpdate,
@@ -143,8 +142,104 @@ export async function scheduleUpcoming(
 }
 
 /** 未送信の本通知・事前通知を取り消す SQL 文 (編集・一時停止・削除時) */
-export function cancelUpcomingStatement(db: ReminderDb, reminderId: number, now: number): DbStatement {
-	return cancelPendingJobsStatement(db, { reminderId, kinds: ['pre', 'main'] }, now);
+export function cancelUpcomingStatement(
+	db: ReminderDb,
+	reminderId: number,
+	now: number,
+	condition?: ExtraCondition,
+): DbStatement {
+	return cancelPendingJobsStatement(db, { reminderId, kinds: ['pre', 'main'] }, now, condition);
+}
+
+/** リマインダの revision が読み取り時の値のままであること (楽観的排他制御) */
+export function unchangedSince(reminder: Pick<ReminderRow, 'id' | 'revision'>): ExtraCondition {
+	return {
+		sql: 'EXISTS (SELECT 1 FROM reminders WHERE id = ? AND revision = ?)',
+		values: [reminder.id, reminder.revision],
+	};
+}
+
+/** 直前の文がちょうど 1 行を変更した場合だけ満たされる条件 (batch 内で前の文が反映された場合だけ続ける) */
+const PREVIOUS_APPLIED: ExtraCondition = { sql: 'changes() = 1', values: [] };
+
+/**
+ * 読み取り後に変更されていない場合だけ、予定の取り消し・内容の更新・次回予定の登録を 1 つの batch で行う
+ * (楽観的排他制御)。更新が反映されたかを返す。
+ * - 予定の取り消しと更新は、revision が読み取り時の値の場合だけ行う
+ * - 次回の予定時刻 (または終了) は更新と同じ UPDATE 文で設定し、ジョブはその UPDATE が反映された場合だけ
+ *   (changes() = 1 の連鎖で) 登録する
+ */
+export async function updateReminderAndSchedule(
+	db: ReminderDb,
+	reminder: ReminderRow,
+	update: ReminderUpdate,
+	params: { now: number; schedule: boolean; condition?: ExtraCondition },
+): Promise<{ applied: boolean; occurrence: Occurrence | null }> {
+	const { now } = params;
+	const unchanged = unchangedSince(reminder);
+	const occurrence = params.schedule
+		? computeNextOccurrence(reminderToSchedule({ ...reminder, ...update }), now)
+		: null;
+	const fullUpdate: ReminderUpdate = params.schedule
+		? occurrence
+			? { ...update, next_run_at: occurrence.runAt }
+			: { ...update, status: 'ended', next_run_at: null }
+		: update;
+	const updateStatement = updateReminderStatement(
+		db,
+		reminder.id,
+		fullUpdate,
+		now,
+		allConditions(unchanged, params.condition),
+	);
+	if (!updateStatement) {
+		throw new Error('Nothing to update');
+	}
+
+	const jobStatements: DbStatement[] = [];
+	if (occurrence) {
+		jobStatements.push(
+			insertJobStatement(
+				db,
+				{
+					reminderId: reminder.id,
+					occurrenceId: null,
+					kind: 'main',
+					runAt: occurrence.runAt,
+					scheduledAt: occurrence.runAt,
+				},
+				now,
+				PREVIOUS_APPLIED,
+			),
+		);
+		const preMinutes = { ...reminder, ...update }.pre_notify_minutes;
+		if (preMinutes) {
+			const preRunAt = occurrence.runAt - preMinutes * MINUTE_MS;
+			if (preRunAt > now) {
+				jobStatements.push(
+					insertJobStatement(
+						db,
+						{
+							reminderId: reminder.id,
+							occurrenceId: null,
+							kind: 'pre',
+							runAt: preRunAt,
+							scheduledAt: occurrence.runAt,
+						},
+						now,
+						PREVIOUS_APPLIED,
+					),
+				);
+			}
+		}
+	}
+
+	const results = await db.batch([
+		cancelUpcomingStatement(db, reminder.id, now, unchanged),
+		updateStatement,
+		...jobStatements,
+	]);
+	return { applied: (results[1]?.results.length ?? 0) > 0, occurrence };
 }
 
 /** 未送信の本通知・事前通知を取り消す (編集・一時停止・削除時) */
@@ -158,7 +253,9 @@ export type CreateReminderResult =
 
 /**
  * リマインダを登録し、最初の通知ジョブを作る。
- * 条件に合う通知日時がない場合は登録せずにエラーを返す。
+ * リマインダと最初のジョブは 1 つの batch (トランザクション) で登録するため、途中で失敗しても
+ * ジョブのない有効なリマインダは残らない。件数の上限も同じ batch の中で確認する。
+ * 条件に合う通知日時がない場合・上限に達している場合は登録せずにエラーを返す。
  */
 export async function createReminder(db: ReminderDb, input: ReminderInput, now: number): Promise<CreateReminderResult> {
 	const draft: ReminderRow = {
@@ -167,42 +264,36 @@ export async function createReminder(db: ReminderDb, input: ReminderInput, now: 
 		status: 'active',
 		last_error: null,
 		next_run_at: null,
+		revision: 0,
 		created_at: now,
 		updated_at: now,
 	};
-	if (!computeNextOccurrence(reminderToSchedule(draft), now)) {
+	const occurrence = computeNextOccurrence(reminderToSchedule(draft), now);
+	if (!occurrence) {
 		return { ok: false, message: '条件に合う通知日時がありません。日時・繰り返し・終了日を確認してください。' };
 	}
 
-	const id = await insertReminderWithinLimits(
-		db,
-		input,
-		{ perUser: MAX_REMINDERS_PER_USER, perGuild: MAX_REMINDERS_PER_GUILD },
-		now,
+	const preRunAt = input.pre_notify_minutes ? occurrence.runAt - input.pre_notify_minutes * MINUTE_MS : null;
+	const [inserted] = await db.batch<{ id: number }>(
+		insertReminderWithFirstJobsStatements(
+			db,
+			input,
+			{ runAt: occurrence.runAt, preRunAt: preRunAt !== null && preRunAt > now ? preRunAt : null },
+			{ perUser: MAX_REMINDERS_PER_USER, perGuild: MAX_REMINDERS_PER_GUILD },
+			now,
+		),
 	);
-	if (id === null) {
+	const id = inserted?.results[0]?.id;
+	if (id === undefined) {
 		return {
 			ok: false,
 			message: '登録できるリマインダの上限に達しています。不要なものを /remind delete で削除してください。',
 		};
 	}
 
-	try {
-		const reminder = await getReminder(db, id);
-		if (!reminder) {
-			throw new Error(`Reminder ${id} disappeared`);
-		}
-		// 登録直後に一時停止・編集された場合は、その操作を優先して予定を登録しない
-		const occurrence = await scheduleUpcoming(db, reminder, now, now, { guardUpdatedAt: reminder.updated_at });
-		if (!occurrence) {
-			throw new Error(`Reminder ${id} has no occurrence`);
-		}
-		return { ok: true, reminder: { ...reminder, next_run_at: occurrence.runAt }, occurrence };
-	} catch (error) {
-		// 通知ジョブのない有効なリマインダが残らないよう、登録を取り消す
-		await deleteReminder(db, id).catch((deleteError) =>
-			console.error(`Failed to roll back reminder ${id}:`, deleteError),
-		);
-		throw error;
+	const reminder = await getReminder(db, id);
+	if (!reminder) {
+		throw new Error(`Reminder ${id} disappeared`);
 	}
+	return { ok: true, reminder, occurrence };
 }

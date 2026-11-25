@@ -872,12 +872,35 @@ describe('atomicity', () => {
 		expect(reminders(db)).toHaveLength(25);
 	});
 
-	it('rolls back the reminder when scheduling its first job fails', async () => {
+	it('creates the reminder and its first jobs in one transaction', async () => {
 		const db = createTestDb();
-		vi.spyOn(db, 'batch').mockRejectedValueOnce(new Error('D1 unavailable'));
-		await expect(createReminder(db, input(), NOW)).rejects.toThrow('D1 unavailable');
+		const batch = db.batch.bind(db);
+		// リマインダの登録後、ジョブの登録の途中で失敗した状況を再現する (最後に失敗する文を足す)
+		vi.spyOn(db, 'batch').mockImplementationOnce((statements) =>
+			batch([...statements, db.prepare('INSERT INTO no_such_table VALUES (1)')]),
+		);
+		await expect(createReminder(db, input({ pre_notify_minutes: 10 }), NOW)).rejects.toThrow();
 		expect(reminders(db)).toHaveLength(0);
 		expect(jobs(db)).toHaveLength(0);
+
+		const result = await createReminder(db, input({ pre_notify_minutes: 10 }), NOW);
+		expect(result.ok).toBe(true);
+		const [reminder] = reminders(db);
+		expect(jobs(db).map((job) => [job.reminder_id, job.kind, job.status])).toEqual([
+			[reminder!.id, 'main', 'pending'],
+			[reminder!.id, 'pre', 'pending'],
+		]);
+		expect(reminder?.next_run_at).toBe(jobs(db)[0]?.run_at);
+	});
+
+	it('creates no jobs when the limit is reached', async () => {
+		const db = createTestDb();
+		for (let i = 0; i < 25; i++) {
+			await seed(db);
+		}
+		const before = jobs(db).length;
+		expect(await createReminder(db, input(), NOW)).toMatchObject({ ok: false });
+		expect(jobs(db)).toHaveLength(before);
 	});
 
 	it('keeps the existing schedule when an edit fails midway', async () => {
@@ -932,19 +955,65 @@ describe('atomicity', () => {
 		expect(jobs(db, ended.id).filter((job) => job.status === 'pending')).toHaveLength(0);
 	});
 
-	it('does not schedule a reminder that was paused right after being registered', async () => {
+	it('rejects an edit when the reminder was changed after it was read', async () => {
 		const db = createTestDb();
+		const reminder = await seed(db);
+		const before = jobs(db, reminder.id);
 		const batch = db.batch.bind(db);
 		vi.spyOn(db, 'batch').mockImplementationOnce(async (statements) => {
-			// 登録の確定後、最初の予定を登録する前に一時停止された状況を再現する
-			db.raw.exec(`UPDATE reminders SET status = 'paused', next_run_at = NULL, updated_at = ${NOW + 1}`);
+			// 読み取り後、batch の前に通知処理などがリマインダを更新した状況を再現する
+			db.raw.exec(`UPDATE reminders SET revision = revision + 1 WHERE id = ${reminder.id}`);
 			return batch(statements);
 		});
 
-		await createReminder(db, input(), NOW);
+		expect(await run(db, 'edit', [opt('id', reminder.id), opt('time', '10:00')])).toContain(
+			'同時に更新されたため、変更を保存できませんでした',
+		);
+		expect(jobs(db, reminder.id)).toEqual(before);
+		expect((await getReminder(db, reminder.id))?.time_of_day).toBe(reminder.time_of_day);
+	});
 
-		expect(reminders(db)).toMatchObject([{ status: 'paused', next_run_at: null }]);
-		expect(jobs(db)).toHaveLength(0);
+	it('does not revive past the limit when an active reminder ends after being read', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db);
+		for (let i = 0; i < 24; i++) {
+			await seed(db);
+		}
+		const batch = db.batch.bind(db);
+		vi.spyOn(db, 'batch').mockImplementationOnce(async (statements) => {
+			// 読み取り時は active だったが、batch の前に終了し、空いた枠に別の登録が入った状況を再現する
+			db.raw.exec(
+				`UPDATE reminders SET status = 'ended', next_run_at = NULL, revision = revision + 1 WHERE id = ${reminder.id}`,
+			);
+			await seed(db);
+			return batch(statements);
+		});
+
+		expect(await run(db, 'edit', [opt('id', reminder.id), opt('time', '10:00')])).toContain('同時に更新されたため');
+		expect((await getReminder(db, reminder.id))?.status).toBe('ended');
+		expect(reminders(db).filter((row) => row.status !== 'ended')).toHaveLength(25);
+	});
+
+	it('does not lose the schedule when two edits revive the same reminder concurrently', async () => {
+		const db = createTestDb();
+		const ended = await seed(db);
+		db.raw.exec(`UPDATE reminders SET status = 'ended', next_run_at = NULL WHERE id = ${ended.id}`);
+		db.raw.exec("UPDATE reminder_jobs SET status = 'cancelled'");
+		const batch = db.batch.bind(db);
+		let raced = false;
+		vi.spyOn(db, 'batch').mockImplementation(async (statements) => {
+			if (!raced) {
+				// 1 つ目の編集の batch の前に、2 つ目の編集が先に復活させた状況を再現する
+				raced = true;
+				await run(db, 'edit', [opt('id', ended.id), opt('time', '11:00')]);
+			}
+			return batch(statements);
+		});
+
+		expect(await run(db, 'edit', [opt('id', ended.id), opt('time', '10:00')])).toContain('同時に更新されたため');
+		const reminder = await getReminder(db, ended.id);
+		expect(reminder).toMatchObject({ status: 'active', time_of_day: 11 * 60 });
+		expect(jobs(db, ended.id).filter((job) => job.status === 'pending')).toHaveLength(1);
 	});
 });
 

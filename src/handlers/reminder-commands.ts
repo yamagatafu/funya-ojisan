@@ -59,7 +59,12 @@ import {
 	withinLimitsCondition,
 } from '../reminder/repository.ts';
 import { computeNextOccurrence, HOLIDAY_POLICIES, SCHEDULE_TYPES } from '../reminder/schedule.ts';
-import { cancelUpcomingStatement, createReminder, planUpcoming, reminderToSchedule } from '../reminder/service.ts';
+import {
+	cancelUpcomingStatement,
+	createReminder,
+	reminderToSchedule,
+	updateReminderAndSchedule,
+} from '../reminder/service.ts';
 import type { DbStatement } from '../types.ts';
 
 function compact(statements: (DbStatement | null)[]): DbStatement[] {
@@ -349,6 +354,10 @@ function checkCurrentTarget(inv: Invocation, reminder: ReminderRow, action: 'edi
 	return target ? checkChannelTarget(target) : { ok: false, message: '通知先のチャンネルを特定できませんでした。' };
 }
 
+function conflictMessage(id: number): string {
+	return `リマインダ #${id} は他の操作 (通知・編集など) と同時に更新されたため、変更を保存できませんでした。もう一度実行してください。`;
+}
+
 async function handleEdit(inv: Invocation): Promise<Reply> {
 	const reminder = await findManageableReminder(inv);
 	if (!reminder) {
@@ -451,37 +460,30 @@ async function handleEdit(inv: Invocation): Promise<Reply> {
 		update.next_run_at = null;
 	}
 
-	// 予定の取り消し・内容の更新・次回予定の登録は 1 つの batch で行い、途中で失敗しても予定が消えないようにする。
-	// 終了済みからの復活は、件数の上限を UPDATE の条件に含める (確認と更新の間に登録が入っても上限を超えない)。
-	// 次回予定は、この UPDATE が反映された (updated_at が今回の時刻になった) 場合だけ登録する
+	// 予定の取り消し・内容の更新・次回予定の登録は、読み取り後に変更されていない場合だけ 1 つの batch で行う
+	// (途中で失敗しても予定が消えず、同時に行われた通知・編集の結果も上書きしない)。
+	// 終了済みからの復活は、件数の上限も UPDATE の条件に含める (確認と更新の間に登録が入っても上限を超えない)
 	const reviving = reminder.status === 'ended';
-	await inv.db.batch([
-		cancelUpcomingStatement(inv.db, reminder.id, inv.now),
-		...compact([
-			updateReminderStatement(
-				inv.db,
-				reminder.id,
-				update,
-				inv.now,
-				reviving
-					? withinLimitsCondition(
-							{ guildId: reminder.guild_id, ownerId: reminder.owner_id },
-							{ perUser: MAX_REMINDERS_PER_USER, perGuild: MAX_REMINDERS_PER_GUILD },
-						)
-					: undefined,
-			),
-		]),
-		...(paused
-			? []
-			: planUpcoming(inv.db, { ...merged, ...update }, inv.now, inv.now, { guardUpdatedAt: inv.now }).statements),
-	]);
+	const { applied } = await updateReminderAndSchedule(inv.db, reminder, update, {
+		now: inv.now,
+		schedule: !paused,
+		condition: reviving
+			? withinLimitsCondition(
+					{ guildId: reminder.guild_id, ownerId: reminder.owner_id },
+					{ perUser: MAX_REMINDERS_PER_USER, perGuild: MAX_REMINDERS_PER_GUILD },
+				)
+			: undefined,
+	});
 	const saved = await getReminder(inv.db, reminder.id);
 	if (!saved) {
 		return notFound(reminder.id);
 	}
-	if (reviving && saved.status === 'ended') {
-		// 件数の条件を満たさず、UPDATE が反映されなかった
-		return `登録できるリマインダの上限に達しているため、リマインダ #${reminder.id} を再開できませんでした。不要なものを /remind delete で削除してください。`;
+	if (!applied) {
+		if (reviving && saved.revision === reminder.revision) {
+			// 読み取り後の変更はなく、件数の条件を満たさなかった
+			return `登録できるリマインダの上限に達しているため、リマインダ #${reminder.id} を再開できませんでした。不要なものを /remind delete で削除してください。`;
+		}
+		return conflictMessage(reminder.id);
 	}
 	return buildReminderSummary(saved, `✏️ リマインダ #${reminder.id} を更新しました`);
 }
@@ -592,20 +594,17 @@ async function handleResume(inv: Invocation): Promise<Reply> {
 	if (!check.ok) {
 		return check.message;
 	}
-	// エラー状態から再開する場合に、残っている予定と重複しないようにする
-	// 予定の取り消し・状態の更新・次回予定の登録は 1 つの batch で行い、途中で失敗しても状態が食い違わないようにする
-	const { occurrence, statements } = planUpcoming(
+	// エラー状態から再開する場合に残っている予定と重複しないよう、取り消してから登録し直す。
+	// 予定の取り消し・状態の更新・次回予定の登録は、読み取り後に変更されていない場合だけ 1 つの batch で行う
+	const { applied, occurrence } = await updateReminderAndSchedule(
 		inv.db,
-		{ ...reminder, status: 'active', last_error: null },
-		inv.now,
-		inv.now,
-		{ guardUpdatedAt: inv.now },
+		reminder,
+		{ status: 'active', last_error: null },
+		{ now: inv.now, schedule: true },
 	);
-	await inv.db.batch([
-		cancelUpcomingStatement(inv.db, reminder.id, inv.now),
-		...compact([updateReminderStatement(inv.db, reminder.id, { status: 'active', last_error: null }, inv.now)]),
-		...statements,
-	]);
+	if (!applied) {
+		return conflictMessage(reminder.id);
+	}
 	const saved = (await getReminder(inv.db, reminder.id)) ?? reminder;
 	if (!occurrence) {
 		return buildReminderSummary(
