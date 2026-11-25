@@ -364,6 +364,24 @@ describe('reminder action buttons', () => {
 	});
 
 	describe('権限', () => {
+		it('rejects operating a reminder of another guild', async () => {
+			const { db, occurrenceId, nagJobId } = await setup({ guild_id: '100000000000000001' });
+
+			for (const customId of [`remind_done;${occurrenceId}`, `remind_snooze;${occurrenceId}:5`]) {
+				// 他のサーバーで MANAGE_MESSAGES を持つメンバーが、ID を指定して操作した状況を再現する
+				const body = await send(
+					db,
+					buttonInteraction(customId, occurrenceId, { userId: OTHER_ID, permissions: MODERATOR_PERMISSIONS }),
+				);
+				expectEphemeral(
+					body,
+					'この通知を操作できるのは、登録者・メンション対象のメンバー・メッセージの管理権限を持つ人だけです。',
+				);
+			}
+			expect((await getOccurrence(db, occurrenceId))?.state).toBe('open');
+			expect(jobs(db).find((job) => job.id === nagJobId)?.status).toBe('pending');
+		});
+
 		it('rejects a user who is neither the owner, the mention target nor a moderator', async () => {
 			const { db, occurrenceId } = await setup();
 

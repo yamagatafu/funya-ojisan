@@ -42,6 +42,7 @@ const MESSAGES = {
 const CANCELLED_KINDS_ON_ACTION = ['nag', 'snooze'] as const;
 
 interface InteractionLike {
+	guild_id?: string;
 	member?: { user: { id: string }; roles: string[]; permissions: string };
 	message?: { content: string };
 }
@@ -91,6 +92,10 @@ async function loadTarget(
 	const reminder = occurrence ? await getReminder(db, occurrence.reminder_id) : null;
 	if (!occurrence || !reminder) {
 		return { ok: false, message: MESSAGES.deleted };
+	}
+	// 他のサーバーのリマインダは操作させない (custom_id は改変できるため、ID だけで対象を信用しない)
+	if (!interaction.guild_id || reminder.guild_id !== interaction.guild_id) {
+		return { ok: false, message: MESSAGES.forbidden };
 	}
 	const userId = member.user.id;
 	// 完了した本人の再操作は、応答の失敗などで更新されなかったメッセージを直せるよう受け付ける
