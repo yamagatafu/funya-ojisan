@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { factory } from '../src/factory.ts';
 import { transporterHandlers } from '../src/handlers/transporter.ts';
 import type { AppBindings, PanelKvStore } from '../src/types.ts';
+import { createUnusedDb } from './helpers/d1.ts';
 
 const TARGET_CHANNEL_ID = '987654321098765432';
 
@@ -43,6 +44,7 @@ function createTestEnv(initialKv: Record<string, string> = {}) {
 		DISCORD_TOKEN: 'test-bot-token',
 		TARGET_CHANNEL_ID,
 		PANEL_KV: kv,
+		REMINDER_DB: createUnusedDb(),
 	} satisfies AppBindings;
 
 	return { env, kv, store };

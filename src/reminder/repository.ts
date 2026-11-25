@@ -1,0 +1,350 @@
+import type { ReminderDb } from '../types.ts';
+import type { HolidayPolicy, ScheduleType } from './schedule.ts';
+
+export type MentionType = 'self' | 'user' | 'role' | 'none';
+export type ReminderStatus = 'active' | 'paused' | 'ended' | 'error';
+export type JobKind = 'pre' | 'main' | 'snooze' | 'nag';
+export type JobStatus = 'pending' | 'processing' | 'sent' | 'failed' | 'cancelled';
+export type OccurrenceState = 'open' | 'completed' | 'superseded';
+
+export interface ReminderRow {
+	id: number;
+	guild_id: string;
+	channel_id: string;
+	owner_id: string;
+	content: string;
+	source_message_url: string | null;
+	mention_type: MentionType;
+	mention_target_id: string | null;
+	schedule_type: ScheduleType;
+	time_of_day: number;
+	once_at: number | null;
+	weekdays_mask: number | null;
+	day_of_month: number | null;
+	nth_week: number | null;
+	start_date: string | null;
+	holiday_policy: HolidayPolicy;
+	pre_notify_minutes: number | null;
+	nag_interval_minutes: number | null;
+	nag_max_count: number | null;
+	end_date: string | null;
+	remaining_count: number | null;
+	status: ReminderStatus;
+	last_error: string | null;
+	next_run_at: number | null;
+	created_at: number;
+	updated_at: number;
+}
+
+/** 登録時に指定する項目 */
+export type ReminderInput = Omit<
+	ReminderRow,
+	'id' | 'status' | 'last_error' | 'next_run_at' | 'created_at' | 'updated_at'
+>;
+
+export type ReminderUpdate = Partial<Omit<ReminderRow, 'id' | 'created_at' | 'updated_at'>>;
+
+export interface OccurrenceRow {
+	id: number;
+	reminder_id: number;
+	scheduled_at: number;
+	last_message_id: string | null;
+	nag_count: number;
+	state: OccurrenceState;
+	completed_by: string | null;
+	completed_at: number | null;
+}
+
+export interface JobRow {
+	id: number;
+	reminder_id: number;
+	occurrence_id: number | null;
+	kind: JobKind;
+	run_at: number;
+	scheduled_at: number;
+	status: JobStatus;
+	attempt_count: number;
+	locked_at: number | null;
+	updated_at: number;
+}
+
+/** processing のまま放置されたジョブを再取得するまでの時間 */
+export const STALE_LOCK_MS = 5 * 60 * 1000;
+/** 終了したリマインダ・処理済みジョブを保持する期間 */
+const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+const REMINDER_INPUT_COLUMNS = [
+	'guild_id',
+	'channel_id',
+	'owner_id',
+	'content',
+	'source_message_url',
+	'mention_type',
+	'mention_target_id',
+	'schedule_type',
+	'time_of_day',
+	'once_at',
+	'weekdays_mask',
+	'day_of_month',
+	'nth_week',
+	'start_date',
+	'holiday_policy',
+	'pre_notify_minutes',
+	'nag_interval_minutes',
+	'nag_max_count',
+	'end_date',
+	'remaining_count',
+] as const satisfies readonly (keyof ReminderInput)[];
+
+const REMINDER_UPDATABLE_COLUMNS = new Set<string>([...REMINDER_INPUT_COLUMNS, 'status', 'last_error', 'next_run_at']);
+
+// ---- reminders ----
+
+export async function insertReminder(db: ReminderDb, input: ReminderInput, now: number): Promise<number> {
+	const columns = [...REMINDER_INPUT_COLUMNS, 'status', 'created_at', 'updated_at'];
+	const values = [...REMINDER_INPUT_COLUMNS.map((column) => input[column]), 'active', now, now];
+	const row = await db
+		.prepare(
+			`INSERT INTO reminders (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')}) RETURNING id`,
+		)
+		.bind(...values)
+		.first<{ id: number }>();
+	if (!row) {
+		throw new Error('Failed to insert reminder');
+	}
+	return row.id;
+}
+
+export function getReminder(db: ReminderDb, id: number): Promise<ReminderRow | null> {
+	return db.prepare('SELECT * FROM reminders WHERE id = ?').bind(id).first<ReminderRow>();
+}
+
+export async function updateReminder(db: ReminderDb, id: number, update: ReminderUpdate, now: number): Promise<void> {
+	const entries = Object.entries(update).filter(
+		([column, value]) => REMINDER_UPDATABLE_COLUMNS.has(column) && value !== undefined,
+	);
+	if (entries.length === 0) {
+		return;
+	}
+	const assignments = [...entries.map(([column]) => `${column} = ?`), 'updated_at = ?'];
+	await db
+		.prepare(`UPDATE reminders SET ${assignments.join(', ')} WHERE id = ?`)
+		.bind(...entries.map(([, value]) => value), now, id)
+		.run();
+}
+
+export async function deleteReminder(db: ReminderDb, id: number): Promise<void> {
+	await db.prepare('DELETE FROM reminders WHERE id = ?').bind(id).run();
+}
+
+export async function listReminders(
+	db: ReminderDb,
+	params: { guildId: string; ownerId?: string; includeEnded?: boolean; limit: number },
+): Promise<ReminderRow[]> {
+	const conditions = ['guild_id = ?'];
+	const values: unknown[] = [params.guildId];
+	if (params.ownerId) {
+		conditions.push('owner_id = ?');
+		values.push(params.ownerId);
+	}
+	if (!params.includeEnded) {
+		conditions.push("status != 'ended'");
+	}
+	const { results } = await db
+		.prepare(
+			`SELECT * FROM reminders WHERE ${conditions.join(' AND ')} ORDER BY next_run_at IS NULL, next_run_at, id LIMIT ?`,
+		)
+		.bind(...values, params.limit)
+		.all<ReminderRow>();
+	return results;
+}
+
+/** 終了していないリマインダの件数 */
+export async function countLiveReminders(
+	db: ReminderDb,
+	params: { guildId: string; ownerId?: string },
+): Promise<number> {
+	const row = params.ownerId
+		? await db
+				.prepare(
+					"SELECT COUNT(*) AS count FROM reminders WHERE guild_id = ? AND owner_id = ? AND status != 'ended'",
+				)
+				.bind(params.guildId, params.ownerId)
+				.first<{ count: number }>()
+		: await db
+				.prepare("SELECT COUNT(*) AS count FROM reminders WHERE guild_id = ? AND status != 'ended'")
+				.bind(params.guildId)
+				.first<{ count: number }>();
+	return row?.count ?? 0;
+}
+
+// ---- occurrences ----
+
+export async function insertOccurrence(db: ReminderDb, reminderId: number, scheduledAt: number): Promise<number> {
+	const row = await db
+		.prepare(
+			"INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state) VALUES (?, ?, 'open') RETURNING id",
+		)
+		.bind(reminderId, scheduledAt)
+		.first<{ id: number }>();
+	if (!row) {
+		throw new Error('Failed to insert occurrence');
+	}
+	return row.id;
+}
+
+export function getOccurrence(db: ReminderDb, id: number): Promise<OccurrenceRow | null> {
+	return db.prepare('SELECT * FROM reminder_occurrences WHERE id = ?').bind(id).first<OccurrenceRow>();
+}
+
+export async function deleteOccurrence(db: ReminderDb, id: number): Promise<void> {
+	await db.prepare('DELETE FROM reminder_occurrences WHERE id = ?').bind(id).run();
+}
+
+export async function updateOccurrence(
+	db: ReminderDb,
+	id: number,
+	update: Partial<Omit<OccurrenceRow, 'id' | 'reminder_id' | 'scheduled_at'>>,
+): Promise<void> {
+	const entries = Object.entries(update).filter(([, value]) => value !== undefined);
+	if (entries.length === 0) {
+		return;
+	}
+	await db
+		.prepare(
+			`UPDATE reminder_occurrences SET ${entries.map(([column]) => `${column} = ?`).join(', ')} WHERE id = ?`,
+		)
+		.bind(...entries.map(([, value]) => value), id)
+		.run();
+}
+
+/** open の状態を条件に完了・置き換えを行う。他の処理と競合した場合は false */
+export async function closeOccurrence(
+	db: ReminderDb,
+	id: number,
+	state: Exclude<OccurrenceState, 'open'>,
+	params: { by?: string; now: number },
+): Promise<boolean> {
+	const result = await db
+		.prepare(
+			"UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE id = ? AND state = 'open'",
+		)
+		.bind(state, params.by ?? null, params.now, id)
+		.run();
+	return result.meta.changes === 1;
+}
+
+export async function listOpenOccurrences(db: ReminderDb, reminderId: number): Promise<OccurrenceRow[]> {
+	const { results } = await db
+		.prepare("SELECT * FROM reminder_occurrences WHERE reminder_id = ? AND state = 'open' ORDER BY id")
+		.bind(reminderId)
+		.all<OccurrenceRow>();
+	return results;
+}
+
+// ---- jobs ----
+
+export async function insertJob(
+	db: ReminderDb,
+	job: { reminderId: number; occurrenceId: number | null; kind: JobKind; runAt: number; scheduledAt: number },
+	now: number,
+): Promise<number> {
+	const row = await db
+		.prepare(
+			"INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?) RETURNING id",
+		)
+		.bind(job.reminderId, job.occurrenceId, job.kind, job.runAt, job.scheduledAt, now)
+		.first<{ id: number }>();
+	if (!row) {
+		throw new Error('Failed to insert job');
+	}
+	return row.id;
+}
+
+export function getJob(db: ReminderDb, id: number): Promise<JobRow | null> {
+	return db.prepare('SELECT * FROM reminder_jobs WHERE id = ?').bind(id).first<JobRow>();
+}
+
+export async function listPendingJobs(db: ReminderDb, reminderId: number): Promise<JobRow[]> {
+	const { results } = await db
+		.prepare("SELECT * FROM reminder_jobs WHERE reminder_id = ? AND status = 'pending' ORDER BY run_at, id")
+		.bind(reminderId)
+		.all<JobRow>();
+	return results;
+}
+
+/** 未送信のジョブを取り消す。kinds を省略するとすべての種類が対象 */
+export async function cancelPendingJobs(
+	db: ReminderDb,
+	params: { reminderId: number; occurrenceId?: number; kinds?: JobKind[] },
+	now: number,
+): Promise<void> {
+	const conditions = ['reminder_id = ?', "status = 'pending'"];
+	const values: unknown[] = [params.reminderId];
+	if (params.occurrenceId !== undefined) {
+		conditions.push('occurrence_id = ?');
+		values.push(params.occurrenceId);
+	}
+	if (params.kinds && params.kinds.length > 0) {
+		conditions.push(`kind IN (${params.kinds.map(() => '?').join(', ')})`);
+		values.push(...params.kinds);
+	}
+	await db
+		.prepare(`UPDATE reminder_jobs SET status = 'cancelled', updated_at = ? WHERE ${conditions.join(' AND ')}`)
+		.bind(now, ...values)
+		.run();
+}
+
+export async function findDueJobs(db: ReminderDb, now: number, limit: number): Promise<JobRow[]> {
+	const { results } = await db
+		.prepare(
+			"SELECT * FROM reminder_jobs WHERE (status = 'pending' AND run_at <= ?) OR (status = 'processing' AND locked_at < ?) ORDER BY run_at, id LIMIT ?",
+		)
+		.bind(now, now - STALE_LOCK_MS, limit)
+		.all<JobRow>();
+	return results;
+}
+
+/** ジョブを排他的に確保する。他の実行が確保済みなら false */
+export async function claimJob(db: ReminderDb, id: number, now: number): Promise<boolean> {
+	const result = await db
+		.prepare(
+			"UPDATE reminder_jobs SET status = 'processing', locked_at = ?, updated_at = ? WHERE id = ? AND ((status = 'pending' AND run_at <= ?) OR (status = 'processing' AND locked_at < ?))",
+		)
+		.bind(now, now, id, now, now - STALE_LOCK_MS)
+		.run();
+	return result.meta.changes === 1;
+}
+
+export async function updateJob(
+	db: ReminderDb,
+	id: number,
+	update: Partial<Pick<JobRow, 'status' | 'run_at' | 'attempt_count' | 'occurrence_id'>>,
+	now: number,
+): Promise<void> {
+	const entries = Object.entries(update).filter(([, value]) => value !== undefined);
+	await db
+		.prepare(
+			`UPDATE reminder_jobs SET ${[...entries.map(([column]) => `${column} = ?`), 'locked_at = NULL', 'updated_at = ?'].join(', ')} WHERE id = ?`,
+		)
+		.bind(...entries.map(([, value]) => value), now, id)
+		.run();
+}
+
+// ---- maintenance ----
+
+/** 保持期間を過ぎた処理済みジョブ・終了した通知・終了したリマインダを削除する */
+export async function cleanupExpired(db: ReminderDb, now: number): Promise<void> {
+	const threshold = now - RETENTION_MS;
+	await db.batch([
+		db
+			.prepare("DELETE FROM reminder_jobs WHERE status IN ('sent', 'failed', 'cancelled') AND updated_at < ?")
+			.bind(threshold),
+		db
+			.prepare(
+				"DELETE FROM reminder_occurrences WHERE state != 'open' AND COALESCE(completed_at, scheduled_at) < ?",
+			)
+			.bind(threshold),
+		db.prepare("DELETE FROM reminders WHERE status = 'ended' AND updated_at < ?").bind(threshold),
+	]);
+}
