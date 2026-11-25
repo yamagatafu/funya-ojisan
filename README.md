@@ -135,9 +135,28 @@ pnpm exec wrangler d1 migrations apply funya-ojisan-reminder --remote
 
 プレビュー環境用に D1 データベースを分離した場合 (`wrangler.jsonc` の `previews.d1_databases` に別の `database_id` を設定した場合) は、そのデータベースにも同じマイグレーションを適用してください。適用しないとテーブルが存在せず、プレビュー環境でリマインダを操作できません。
 
+> [!WARNING]
+> `wrangler d1 migrations apply` は、設定ファイルのトップレベルの `d1_databases` から対象を解決し、`previews` は参照しません。`wrangler.jsonc` のままプレビュー用のデータベース名を指定すると見つからずに失敗し、名前を変えずに ID だけを分離している場合は本番のデータベースに適用されます。
+
+プレビュー用のデータベースをトップレベルに指定した、マイグレーション専用の設定ファイル (例: `wrangler.preview-d1.jsonc`。コミット不要) を作り、`--config` で指定して適用します。
+
+```jsonc
+// wrangler.preview-d1.jsonc
+{
+	"name": "funya-ojisan",
+	"d1_databases": [
+		{
+			"binding": "REMINDER_DB",
+			"database_name": "<プレビュー用のデータベース名>",
+			"database_id": "<プレビュー用のデータベース ID>",
+			"migrations_dir": "migrations"
+		}
+	]
+}
+```
+
 ```bash
-# プレビュー用 (データベース名は previews.d1_databases の database_name に置き換える)
-pnpm exec wrangler d1 migrations apply <プレビュー用のデータベース名> --remote
+pnpm exec wrangler d1 migrations apply <プレビュー用のデータベース名> --remote --config wrangler.preview-d1.jsonc
 ```
 
 マイグレーションを追加した場合は、ローカル・本番 (・分離したプレビュー) のそれぞれに再度適用してください。適用済みのものはスキップされます。
