@@ -9,6 +9,7 @@ import {
 	cleanupExpired,
 	closeOccurrenceStatement,
 	findDueJobs,
+	findRemindersWithoutSchedule,
 	getOccurrence,
 	getReminder,
 	insertJobStatement,
@@ -221,6 +222,21 @@ async function processPreJob(ctx: DispatchContext, job: JobRow, reminder: Remind
 	}
 }
 
+/** 送信済みの通知メッセージ (ボタンを外す対象) */
+interface SentMessage {
+	channelId: string;
+	messageId: string | null;
+}
+
+/** 回の通知を送ったチャンネル。migrations/0003 以前の行はリマインダの通知先を使う */
+function occurrenceChannelId(occurrence: Pick<OccurrenceRow, 'channel_id'>, reminder: ReminderRow): string {
+	return occurrence.channel_id ?? reminder.channel_id;
+}
+
+function sentMessageOf(occurrence: OccurrenceRow, reminder: ReminderRow): SentMessage {
+	return { channelId: occurrenceChannelId(occurrence, reminder), messageId: occurrence.last_message_id };
+}
+
 /** 再通知ジョブを登録する SQL 文 (上限に達していれば null) */
 function nagStatement(
 	ctx: DispatchContext,
@@ -250,9 +266,9 @@ async function planSupersede(
 	ctx: DispatchContext,
 	reminder: ReminderRow,
 	keepId: number,
-): Promise<{ statements: DbStatement[]; messageIds: (string | null)[] }> {
+): Promise<{ statements: DbStatement[]; messages: SentMessage[] }> {
 	const statements: DbStatement[] = [];
-	const messageIds: (string | null)[] = [];
+	const messages: SentMessage[] = [];
 	const now = ctx.now();
 	for (const occurrence of await listOpenOccurrences(ctx.db, reminder.id)) {
 		if (occurrence.id === keepId) {
@@ -266,9 +282,9 @@ async function planSupersede(
 				now,
 			),
 		);
-		messageIds.push(occurrence.last_message_id);
+		messages.push(sentMessageOf(occurrence, reminder));
 	}
-	return { statements, messageIds };
+	return { statements, messages };
 }
 
 function compact(statements: (DbStatement | null)[]): DbStatement[] {
@@ -284,7 +300,7 @@ async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: Remin
 	// 前回の実行が送信後に中断していた場合は、送信済みの通知を使い回す (二重送信の防止)
 	let occurrence = job.occurrence_id !== null ? await getOccurrence(ctx.db, job.occurrence_id) : null;
 	if (!occurrence) {
-		const occurrenceId = await insertOccurrence(ctx.db, reminder.id, job.scheduled_at);
+		const occurrenceId = await insertOccurrence(ctx.db, reminder.id, job.scheduled_at, reminder.channel_id);
 		await ctx.db
 			.prepare('UPDATE reminder_jobs SET occurrence_id = ? WHERE id = ?')
 			.bind(occurrenceId, job.id)
@@ -319,26 +335,29 @@ async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: Remin
 	const now = ctx.now();
 	const remainingCount = reminder.remaining_count === null ? null : Math.max(0, reminder.remaining_count - 1);
 	const supersede = await planSupersede(ctx, reminder, occurrence.id);
+	// 次回の予定・残り回数・終了状態は、ジョブ取得時に読んだ内容から変更されていない場合だけ反映する。
+	// 処理中に編集・一時停止された場合は、編集側で登録した予定を優先する (古い内容で上書きしない)
 	const upcoming = planUpcoming(
 		ctx.db,
 		{ ...reminder, remaining_count: remainingCount },
 		Math.max(job.scheduled_at, now),
 		now,
+		{
+			guardUpdatedAt: reminder.updated_at,
+			extraUpdate: remainingCount === null ? undefined : { remaining_count: remainingCount },
+		},
 	);
 	await ctx.db.batch(
 		compact([
 			...supersede.statements,
 			nagStatement(ctx, reminder, occurrence, occurrence.nag_count),
-			remainingCount === null
-				? null
-				: updateReminderStatement(ctx.db, reminder.id, { remaining_count: remainingCount }, now),
 			...upcoming.statements,
 			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now),
 		]),
 	);
 
-	for (const messageId of supersede.messageIds) {
-		await removeButtons(ctx.rest, reminder.channel_id, messageId);
+	for (const message of supersede.messages) {
+		await removeButtons(ctx.rest, message.channelId, message.messageId);
 	}
 }
 
@@ -359,11 +378,13 @@ async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: R
 	}
 
 	// 前回の実行が送信後に中断していた場合は、送信済みのメッセージを使い回す (再送の防止)
+	// 再通知・スヌーズは、その回の通知を送ったチャンネルに送る
+	const channelId = occurrenceChannelId(occurrence, reminder);
 	let messageId = job.sent_message_id;
 	if (!messageId) {
 		const outcome = await postMessage(
 			ctx.rest,
-			reminder.channel_id,
+			channelId,
 			buildNotification(reminder, {
 				kind: isNag ? 'nag' : 'snooze',
 				occurrenceId: occurrence.id,
@@ -391,7 +412,7 @@ async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: R
 	);
 
 	if (occurrence.last_message_id !== messageId) {
-		await removeButtons(ctx.rest, reminder.channel_id, occurrence.last_message_id);
+		await removeButtons(ctx.rest, channelId, occurrence.last_message_id);
 	}
 }
 
@@ -409,6 +430,23 @@ async function processJob(ctx: DispatchContext, job: JobRow): Promise<void> {
 		case 'nag':
 		case 'snooze':
 			return processFollowUpJob(ctx, job, reminder);
+	}
+}
+
+/** 自己修復の対象にする最終更新からの経過時間 (処理中の操作と競合しないよう十分に空ける) */
+const REPAIR_MIN_AGE_MS = 10 * MINUTE_MS;
+const REPAIR_BATCH_SIZE = 20;
+
+/**
+ * 有効なのに未送信の本通知ジョブがないリマインダ (途中で失敗した登録・編集などの取り残し) の予定を作り直す。
+ * 読み取り後に変更された場合は何もしない (guard)。
+ */
+async function repairMissingSchedules(ctx: DispatchContext): Promise<void> {
+	const now = ctx.now();
+	for (const reminder of await findRemindersWithoutSchedule(ctx.db, now, REPAIR_MIN_AGE_MS, REPAIR_BATCH_SIZE)) {
+		console.error(`[ALERT] Repairing reminder without a pending main job: reminderId=${reminder.id}`);
+		const { statements } = planUpcoming(ctx.db, reminder, now, now, { guardUpdatedAt: reminder.updated_at });
+		await ctx.db.batch(statements);
 	}
 }
 
@@ -453,6 +491,8 @@ export async function dispatchDueJobs(params: { db: ReminderDb; rest: Rest; now?
 			break;
 		}
 	}
+
+	await repairMissingSchedules(ctx).catch((error) => console.error('Failed to repair reminder schedules:', error));
 
 	// 1 時間に 1 回、古いデータを掃除する
 	if (new Date(startedAt).getUTCMinutes() === 0) {

@@ -2,8 +2,10 @@ import type { DbStatement, ReminderDb } from '../types.ts';
 import { MINUTE_MS } from './date.ts';
 import {
 	cancelPendingJobsStatement,
+	guardCondition,
 	insertJobStatement,
 	type ReminderRow,
+	type ReminderUpdate,
 	updateReminderStatement,
 } from './repository.ts';
 import { computeNextOccurrence, type Occurrence, type Schedule } from './schedule.ts';
@@ -23,22 +25,46 @@ export function reminderToSchedule(reminder: ReminderRow): Schedule {
 	};
 }
 
+export interface PlanOptions {
+	/**
+	 * 指定すると、リマインダが有効で updated_at がこの値と一致する場合だけ反映する
+	 * (一時停止・編集など、読み取り後の変更と競合した場合は何もしない)
+	 */
+	guardUpdatedAt?: number;
+	/** 次回の予定と同じ UPDATE 文で更新する項目 (残り回数など) */
+	extraUpdate?: ReminderUpdate;
+}
+
 /**
  * afterMs より後の次回の本通知 (と事前通知) のジョブを登録し、next_run_at を更新する SQL 文を組み立てる。
  * 次回がなければリマインダを ended にする文を返す。
  * 他の更新と同じ batch (トランザクション) で実行できるよう、実行はしない。
+ * ジョブの登録を先に、リマインダの更新 (updated_at が変わる) を最後に行う。
  */
 export function planUpcoming(
 	db: ReminderDb,
 	reminder: ReminderRow,
 	afterMs: number,
 	now: number,
+	options: PlanOptions = {},
 ): { occurrence: Occurrence | null; statements: DbStatement[] } {
+	const condition =
+		options.guardUpdatedAt === undefined
+			? undefined
+			: guardCondition({ reminderId: reminder.id, updatedAt: options.guardUpdatedAt });
 	const occurrence = computeNextOccurrence(reminderToSchedule(reminder), afterMs);
 	if (!occurrence) {
 		return {
 			occurrence: null,
-			statements: [updateReminderStatement(db, reminder.id, { status: 'ended', next_run_at: null }, now)!],
+			statements: [
+				updateReminderStatement(
+					db,
+					reminder.id,
+					{ ...options.extraUpdate, status: 'ended', next_run_at: null },
+					now,
+					condition,
+				)!,
+			],
 		};
 	}
 
@@ -53,6 +79,7 @@ export function planUpcoming(
 				scheduledAt: occurrence.runAt,
 			},
 			now,
+			condition,
 		),
 	];
 
@@ -70,12 +97,21 @@ export function planUpcoming(
 						scheduledAt: occurrence.runAt,
 					},
 					now,
+					condition,
 				),
 			);
 		}
 	}
 
-	statements.push(updateReminderStatement(db, reminder.id, { next_run_at: occurrence.runAt }, now)!);
+	statements.push(
+		updateReminderStatement(
+			db,
+			reminder.id,
+			{ ...options.extraUpdate, next_run_at: occurrence.runAt },
+			now,
+			condition,
+		)!,
+	);
 	return { occurrence, statements };
 }
 
@@ -88,8 +124,9 @@ export async function scheduleUpcoming(
 	reminder: ReminderRow,
 	afterMs: number,
 	now: number,
+	options: PlanOptions = {},
 ): Promise<Occurrence | null> {
-	const { occurrence, statements } = planUpcoming(db, reminder, afterMs, now);
+	const { occurrence, statements } = planUpcoming(db, reminder, afterMs, now, options);
 	await db.batch(statements);
 	return occurrence;
 }

@@ -47,6 +47,8 @@ export type ReminderUpdate = Partial<Omit<ReminderRow, 'id' | 'created_at' | 'up
 export interface OccurrenceRow {
 	id: number;
 	reminder_id: number;
+	/** 通知を送信したチャンネル (migrations/0003 以前の行は null) */
+	channel_id: string | null;
 	scheduled_at: number;
 	last_message_id: string | null;
 	nag_count: number;
@@ -121,11 +123,33 @@ export function getReminder(db: ReminderDb, id: number): Promise<ReminderRow | n
 	return db.prepare('SELECT * FROM reminders WHERE id = ?').bind(id).first<ReminderRow>();
 }
 
+/**
+ * スケジュールの更新を、リマインダが有効で、読み取り時から変更されていない (updated_at が一致する) 場合に限定する条件。
+ * 一時停止・編集などと競合した場合に、古い内容で予定を登録したり状態を上書きしたりしないために使う。
+ */
+export interface ScheduleGuard {
+	reminderId: number;
+	updatedAt: number;
+}
+
+const GUARD_SQL = "EXISTS (SELECT 1 FROM reminders WHERE id = ? AND status = 'active' AND updated_at = ?)";
+
+/** UPDATE / INSERT に追加する WHERE 条件 */
+export interface ExtraCondition {
+	sql: string;
+	values: unknown[];
+}
+
+export function guardCondition(guard: ScheduleGuard): ExtraCondition {
+	return { sql: GUARD_SQL, values: [guard.reminderId, guard.updatedAt] };
+}
+
 export function updateReminderStatement(
 	db: ReminderDb,
 	id: number,
 	update: ReminderUpdate,
 	now: number,
+	condition?: ExtraCondition,
 ): DbStatement | null {
 	const entries = Object.entries(update).filter(
 		([column, value]) => REMINDER_UPDATABLE_COLUMNS.has(column) && value !== undefined,
@@ -134,9 +158,10 @@ export function updateReminderStatement(
 		return null;
 	}
 	const assignments = [...entries.map(([column]) => `${column} = ?`), 'updated_at = ?'];
+	const where = condition ? `id = ? AND ${condition.sql}` : 'id = ?';
 	return db
-		.prepare(`UPDATE reminders SET ${assignments.join(', ')} WHERE id = ?`)
-		.bind(...entries.map(([, value]) => value), now, id);
+		.prepare(`UPDATE reminders SET ${assignments.join(', ')} WHERE ${where}`)
+		.bind(...entries.map(([, value]) => value), now, id, ...(condition?.values ?? []));
 }
 
 export async function updateReminder(db: ReminderDb, id: number, update: ReminderUpdate, now: number): Promise<void> {
@@ -190,12 +215,17 @@ export async function countLiveReminders(
 
 // ---- occurrences ----
 
-export async function insertOccurrence(db: ReminderDb, reminderId: number, scheduledAt: number): Promise<number> {
+export async function insertOccurrence(
+	db: ReminderDb,
+	reminderId: number,
+	scheduledAt: number,
+	channelId: string,
+): Promise<number> {
 	const row = await db
 		.prepare(
-			"INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state) VALUES (?, ?, 'open') RETURNING id",
+			"INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state, channel_id) VALUES (?, ?, 'open', ?) RETURNING id",
 		)
-		.bind(reminderId, scheduledAt)
+		.bind(reminderId, scheduledAt, channelId)
 		.first<{ id: number }>();
 	if (!row) {
 		throw new Error('Failed to insert occurrence');
@@ -281,8 +311,18 @@ export interface NewJob {
 const INSERT_JOB_SQL =
 	"INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)";
 
-export function insertJobStatement(db: ReminderDb, job: NewJob, now: number): DbStatement {
-	return db.prepare(INSERT_JOB_SQL).bind(job.reminderId, job.occurrenceId, job.kind, job.runAt, job.scheduledAt, now);
+/** condition を指定すると、その条件を満たす場合だけ登録する */
+export function insertJobStatement(db: ReminderDb, job: NewJob, now: number, condition?: ExtraCondition): DbStatement {
+	if (!condition) {
+		return db
+			.prepare(INSERT_JOB_SQL)
+			.bind(job.reminderId, job.occurrenceId, job.kind, job.runAt, job.scheduledAt, now);
+	}
+	return db
+		.prepare(
+			`INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) SELECT ?, ?, ?, ?, ?, 'pending', ? WHERE ${condition.sql}`,
+		)
+		.bind(job.reminderId, job.occurrenceId, job.kind, job.runAt, job.scheduledAt, now, ...condition.values);
 }
 
 export async function insertJob(db: ReminderDb, job: NewJob, now: number): Promise<number> {
@@ -381,6 +421,27 @@ export async function recordJobSentMessage(db: ReminderDb, id: number, messageId
 }
 
 // ---- maintenance ----
+
+/**
+ * 有効なのに未送信の本通知ジョブがないリマインダ (途中で失敗した処理の取り残し) を探す。
+ * 処理中の操作と競合しないよう、最終更新から minAgeMs 以上経ったものだけを対象にする。
+ */
+export async function findRemindersWithoutSchedule(
+	db: ReminderDb,
+	now: number,
+	minAgeMs: number,
+	limit: number,
+): Promise<ReminderRow[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT * FROM reminders r WHERE r.status = 'active' AND r.updated_at < ?
+			AND NOT EXISTS (SELECT 1 FROM reminder_jobs j WHERE j.reminder_id = r.id AND j.kind = 'main' AND j.status IN ('pending', 'processing'))
+			ORDER BY r.updated_at LIMIT ?`,
+		)
+		.bind(now - minAgeMs, limit)
+		.all<ReminderRow>();
+	return results;
+}
 
 /** 保持期間を過ぎた処理済みジョブ・終了した通知・終了したリマインダを削除する */
 export async function cleanupExpired(db: ReminderDb, now: number): Promise<void> {

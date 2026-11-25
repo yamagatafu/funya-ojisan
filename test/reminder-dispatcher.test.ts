@@ -457,6 +457,91 @@ describe('dispatchDueJobs', () => {
 		expect(jobs(db).find((job) => job.kind === 'nag')?.status).toBe('cancelled');
 	});
 
+	it('does not overwrite a reminder that was edited while its notification was being sent', async () => {
+		const sentAt = jstToUtcMs('2026-11-25', 9 * 60);
+		const editedOnceAt = jstToUtcMs('2026-11-26', 18 * 60);
+		const { db, id } = await setup({ schedule_type: 'once', once_at: sentAt });
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+			if (init?.method === 'POST') {
+				// 送信中に /remind edit で日時が変更された状況を再現する
+				db.raw.exec(
+					`UPDATE reminders SET once_at = ${editedOnceAt}, next_run_at = ${editedOnceAt}, updated_at = ${sentAt + 1} WHERE id = ${id}`,
+				);
+				await insertJob(
+					db,
+					{
+						reminderId: id,
+						occurrenceId: null,
+						kind: 'main',
+						runAt: editedOnceAt,
+						scheduledAt: editedOnceAt,
+					},
+					sentAt,
+				);
+				return jsonResponse({ id: 'msg-1' });
+			}
+			return jsonResponse({});
+		});
+
+		await dispatchDueJobs({ db, rest, now: () => sentAt });
+
+		const reminder = await getReminder(db, id);
+		expect(reminder).toMatchObject({ status: 'active', next_run_at: editedOnceAt });
+		expect(jobs(db).map((job) => [job.status, job.run_at])).toEqual([
+			['sent', sentAt],
+			['pending', editedOnceAt],
+		]);
+	});
+
+	it('does not schedule when the guard no longer matches', async () => {
+		const { db, id } = await setup();
+		db.raw.exec("UPDATE reminder_jobs SET status = 'cancelled'");
+		const reminder = (await getReminder(db, id))!;
+		const now = jstToUtcMs('2026-11-25', 8 * 60);
+
+		await scheduleUpcoming(db, reminder, now, now, { guardUpdatedAt: reminder.updated_at - 1 });
+		expect(jobs(db).filter((job) => job.status === 'pending')).toHaveLength(0);
+
+		await scheduleUpcoming(db, reminder, now, now, { guardUpdatedAt: reminder.updated_at });
+		expect(jobs(db).filter((job) => job.status === 'pending')).toHaveLength(1);
+	});
+
+	it('repairs an active reminder left without a pending main job', async () => {
+		const createdAt = jstToUtcMs('2026-11-25', 8 * 60);
+		const stale = await setup({}, createdAt);
+		const fresh = await setup({}, createdAt);
+		for (const { db } of [stale, fresh]) {
+			db.raw.exec('DELETE FROM reminder_jobs');
+		}
+		mockDiscord();
+
+		await dispatchDueJobs({ db: stale.db, rest, now: () => createdAt + 11 * MINUTE_MS });
+		await dispatchDueJobs({ db: fresh.db, rest, now: () => createdAt + 9 * MINUTE_MS });
+
+		expect(jobs(stale.db).map((job) => [job.kind, job.status, job.run_at])).toEqual([
+			['main', 'pending', jstToUtcMs('2026-11-25', 9 * 60)],
+		]);
+		// 最終更新から間もないものは、処理中の操作と競合しないよう対象外
+		expect(jobs(fresh.db)).toHaveLength(0);
+	});
+
+	it('sends follow-ups and removes buttons in the channel where the occurrence was sent', async () => {
+		const { db, id } = await setup({ nag_interval_minutes: 10, nag_max_count: 1 });
+		const fetchMock = mockDiscord();
+		const start = jstToUtcMs('2026-11-25', 9 * 60);
+		await dispatchDueJobs({ db, rest, now: () => start });
+		db.raw.exec(`UPDATE reminders SET channel_id = '299999999999999999' WHERE id = ${id}`);
+
+		await dispatchDueJobs({ db, rest, now: () => start + 10 * MINUTE_MS });
+
+		expect(calls(fetchMock).map((call) => [call.method, call.url])).toEqual([
+			['POST', `${API}/channels/${CHANNEL_ID}/messages`],
+			['POST', `${API}/channels/${CHANNEL_ID}/messages`],
+			['PATCH', `${API}/channels/${CHANNEL_ID}/messages/msg-1`],
+		]);
+		expect(occurrences(db)).toMatchObject([{ channel_id: CHANNEL_ID }]);
+	});
+
 	it('cancels follow-up jobs of a completed occurrence', async () => {
 		const { db, id } = await setup();
 		const now = jstToUtcMs('2026-11-25', 9 * 60);
