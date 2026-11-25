@@ -361,7 +361,9 @@ export function closeOccurrenceStatement(
 ): DbStatement {
 	const where = condition ? `id = ? AND state = 'open' AND ${condition.sql}` : "id = ? AND state = 'open'";
 	return db
-		.prepare(`UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE ${where}`)
+		.prepare(
+			`UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE ${where} RETURNING id`,
+		)
 		.bind(state, params.by ?? null, params.now, id, ...(condition?.values ?? []));
 }
 
@@ -406,7 +408,7 @@ export function insertJobStatement(db: ReminderDb, job: NewJob, now: number, con
 	}
 	return db
 		.prepare(
-			`INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) SELECT ?, ?, ?, ?, ?, 'pending', ? WHERE ${condition.sql}`,
+			`INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) SELECT ?, ?, ?, ?, ?, 'pending', ? WHERE ${condition.sql} RETURNING id`,
 		)
 		.bind(job.reminderId, job.occurrenceId, job.kind, job.runAt, job.scheduledAt, now, ...condition.values);
 }

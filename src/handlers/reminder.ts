@@ -1,5 +1,6 @@
 import { factory } from '../factory.ts';
 import { dispatchDueJobs } from '../reminder/dispatcher.ts';
+import { reminderActionHandlers } from './reminder-actions.ts';
 import { reminderCommandHandlers } from './reminder-commands.ts';
 
 export const REMINDER_CRON = '* * * * *';
@@ -12,4 +13,4 @@ export const reminderCron = factory.cron(REMINDER_CRON, async (c) => {
 	await dispatchDueJobs({ db: c.env.REMINDER_DB, rest: c.rest });
 });
 
-export const reminderHandlers = [reminderCron, ...reminderCommandHandlers];
+export const reminderHandlers = [reminderCron, ...reminderCommandHandlers, ...reminderActionHandlers];

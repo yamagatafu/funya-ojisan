@@ -144,14 +144,26 @@ export function buildPreNotification(reminder: ReminderRow, runAt: number): Mess
 
 /** 状態表示行 (完了・スヌーズ) の接頭辞。フッター (`-# #`) と区別できる形にする */
 const STATUS_LINE_PATTERN = /^-# (✅|⏰|⏹️) .*$/;
+/** フッター行 (`-# #12 · <@owner> · ...`) */
+const FOOTER_LINE_PATTERN = /^-# #\d+ · /;
 
-/** 既存の状態表示行を取り除いてから、新しい状態表示行を末尾に付ける */
+/**
+ * 既存の状態表示行を取り除いてから、新しい状態表示行を末尾に付ける。
+ * 本文に同じ形式の行があっても消さないよう、取り除くのは最後のフッター行より後ろの行だけにする。
+ */
 export function withStatusLine(content: string, statusLine: string | null): string {
-	const lines = content.split('\n').filter((line) => !STATUS_LINE_PATTERN.test(line));
+	const lines = content.split('\n');
+	let footerIndex = -1;
+	lines.forEach((line, index) => {
+		if (FOOTER_LINE_PATTERN.test(line)) {
+			footerIndex = index;
+		}
+	});
+	const kept = lines.filter((line, index) => index <= footerIndex || !STATUS_LINE_PATTERN.test(line));
 	if (statusLine) {
-		lines.push(`-# ${statusLine}`);
+		kept.push(`-# ${statusLine}`);
 	}
-	return lines.join('\n');
+	return kept.join('\n');
 }
 
 const STATUS_LABELS: Record<ReminderRow['status'], string> = {
