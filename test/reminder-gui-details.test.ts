@@ -324,9 +324,11 @@ describe('[通知設定]', () => {
 		const db = createTestDb();
 		const reminder = await seed(db, { nag_interval_minutes: 30, nag_max_count: 5 });
 
-		const body = await send(db, modalInteraction(`remind_notify_modal;${reminder.id}`, notifyValues({ max: '5' })));
-
-		expect(body.data.content).toContain('を更新しました');
+		for (const max of ['5', '11', 'abc']) {
+			// 範囲外・不正な値が残っていても、間隔が空欄なら検証せずに解除する
+			const body = await send(db, modalInteraction(`remind_notify_modal;${reminder.id}`, notifyValues({ max })));
+			expect(body.data.content).toContain('を更新しました');
+		}
 		expect(await getReminder(db, reminder.id)).toMatchObject({ nag_interval_minutes: null });
 	});
 

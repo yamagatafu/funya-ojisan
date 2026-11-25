@@ -171,18 +171,17 @@ export function parseNotifySettingsValues(
 	if (!nagInterval.ok) {
 		return nagInterval;
 	}
-	const nagMax = readInteger(vars, NOTIFY_FIELD.nagMax, RANGES.nagMax);
-	if (!nagMax.ok) {
-		return nagMax;
-	}
-	// 間隔が空欄なら再通知を解除する (最大回数の欄に値が残っていても無視する)
+	// 間隔が空欄なら再通知を解除する (最大回数の欄は値が残っていても検証せずに無視する)
 	const interval = nagInterval.value ?? 0;
-
 	const options: DetailEditOptions = {
 		pre_notify: preNotify.value ?? 0,
 		nag_interval: interval,
 	};
 	if (interval > 0) {
+		const nagMax = readInteger(vars, NOTIFY_FIELD.nagMax, RANGES.nagMax);
+		if (!nagMax.ok) {
+			return nagMax;
+		}
 		options.nag_max = nagMax.value ?? DEFAULT_NAG_MAX;
 	}
 	const mention = arrayValue(vars, NOTIFY_FIELD.mention)[0] ?? reminder.owner_id;
