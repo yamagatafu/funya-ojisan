@@ -441,7 +441,8 @@ describe('dispatchDueJobs', () => {
 	});
 
 	it('does not send follow-ups for a reminder in error state', async () => {
-		const { db, id } = await setup();
+		// 再通知を送信できる設定にし、error の判定だけで取り消されることを確認する
+		const { db, id } = await setup({ nag_interval_minutes: 10, nag_max_count: 1 });
 		const now = jstToUtcMs('2026-11-25', 9 * 60);
 		db.raw.exec(
 			`INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state, last_message_id) VALUES (${id}, ${now}, 'open', 'msg-x')`,
