@@ -204,7 +204,7 @@ describe('[通知設定]', () => {
 		expect(byId.pre_notify).toMatchObject({ type: ComponentType.TextInput, required: false, value: '10' });
 		expect(byId.nag_interval).toMatchObject({ value: '30' });
 		expect(byId.nag_max).toMatchObject({ value: '5' });
-		expect(body.data.components?.[0]).toMatchObject({ label: 'メンション先', description: '未選択なら自分' });
+		expect(body.data.components?.[0]).toMatchObject({ label: 'メンション先', description: '未選択なら登録者' });
 	});
 
 	it('leaves the fields empty for a self mention without notifications', async () => {
@@ -428,6 +428,15 @@ describe('[期間・祝日]', () => {
 			await send(db, buttonInteraction(`remind_period_settings;${reminder.id}`)),
 			'1回のみのリマインダには期間・祝日を設定できません。',
 		);
+		// モーダルを開いた後に 1 回のみに変更された場合も、送信時に拒否して実行日を書き換えない
+		expectEphemeral(
+			await send(
+				db,
+				modalInteraction(`remind_period_modal;${reminder.id}`, periodValues({ date: '2026-12-10' })),
+			),
+			'1回のみのリマインダには期間・祝日を設定できません。',
+		);
+		expect((await getReminder(db, reminder.id))?.once_at).toBe(reminder.once_at);
 	});
 
 	it('saves the values', async () => {

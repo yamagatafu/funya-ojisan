@@ -33,7 +33,7 @@ import {
 
 const MESSAGES = {
 	notConfigured: 'リマインダの保存先が設定されていません。管理者に連絡してください。',
-	guildOnly: 'このボタンはサーバー内でのみ使用できます。',
+	guildOnly: 'この操作はサーバー内でのみ使用できます。',
 	onceHasNoPeriod: '1回のみのリマインダには期間・祝日を設定できません。',
 	error: 'エラーが発生しました。時間をおいて再度お試しください。',
 } as const;
@@ -146,7 +146,11 @@ export const periodSettingsModal = factory.modal(makeModal(PERIOD_SETTINGS_MODAL
 		c.interaction,
 		c.ref.custom_value,
 		c.interaction.data.resolved,
-		(reminder) => parsePeriodSettingsValues(reminder, c.var),
+		// モーダルを開いた後に 1 回のみに変更された場合などに、実行日を開始日で書き換えないよう送信時にも確認する
+		(reminder) =>
+			reminder.schedule_type === 'once'
+				? { ok: false, message: MESSAGES.onceHasNoPeriod }
+				: parsePeriodSettingsValues(reminder, c.var),
 	);
 	return c.flags('EPHEMERAL').res(data);
 });

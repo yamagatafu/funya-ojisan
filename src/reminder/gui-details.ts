@@ -109,7 +109,7 @@ export function buildNotifySettingsModal(reminder: ReminderRow): APIModalInterac
 				max_values: 1,
 				...(defaultValue ? { default_values: [defaultValue] } : {}),
 			},
-			'未選択なら自分',
+			'未選択なら登録者',
 		),
 		label(
 			RANGES.preNotify.label,
@@ -205,7 +205,7 @@ export function buildPeriodSettingsModal(reminder: ReminderRow): APIModalInterac
 				placeholder: '2026-12-01',
 				...(reminder.start_date ? { value: reminder.start_date } : {}),
 			},
-			'YYYY-MM-DD。空欄なら変更しません',
+			'2026-12-01 または 12/1。空欄なら変更しません',
 		),
 		label('祝日の扱い', {
 			type: ComponentType.RadioGroup,
@@ -227,7 +227,7 @@ export function buildPeriodSettingsModal(reminder: ReminderRow): APIModalInterac
 				placeholder: '2026-12-31',
 				...(reminder.end_date ? { value: reminder.end_date } : {}),
 			},
-			'YYYY-MM-DD。空欄なら終了日なし',
+			'2026-12-31 または 12/31。空欄なら終了日なし',
 		),
 		label(
 			RANGES.count.label,
