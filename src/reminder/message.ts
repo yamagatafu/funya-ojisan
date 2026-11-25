@@ -6,7 +6,7 @@ import {
 	type RESTPostAPIChannelMessageJSONBody,
 } from 'discord-api-types/v10';
 import { formatJstDateTime, formatJstTime, MINUTE_MS, utcMsToJst } from './date.ts';
-import { describeSchedule } from './format.ts';
+import { describeSchedule, discordTimestamp, truncate } from './format.ts';
 import type { ReminderRow } from './repository.ts';
 import { reminderToSchedule } from './service.ts';
 
@@ -150,6 +150,44 @@ export function withStatusLine(content: string, statusLine: string | null): stri
 	const lines = content.split('\n').filter((line) => !STATUS_LINE_PATTERN.test(line));
 	if (statusLine) {
 		lines.push(`-# ${statusLine}`);
+	}
+	return lines.join('\n');
+}
+
+const STATUS_LABELS: Record<ReminderRow['status'], string> = {
+	active: '🟢 有効',
+	paused: '⏸️ 一時停止中',
+	ended: '⏹️ 終了',
+	error: '⚠️ エラー',
+};
+
+export function statusLabel(reminder: Pick<ReminderRow, 'status'>): string {
+	return STATUS_LABELS[reminder.status];
+}
+
+/** 登録・編集後に実行者へ返す要約 (Ephemeral 用) */
+export function buildReminderSummary(reminder: ReminderRow, heading: string): string {
+	const mention = mentionTargetOf(reminder).text.trim();
+	const lines = [
+		heading,
+		`> ${truncate(reminder.content, 200).replaceAll('\n', '\n> ')}`,
+		`- ID: #${reminder.id}（${statusLabel(reminder)}）`,
+		`- 通知先: <#${reminder.channel_id}>${mention ? `（${mention}）` : ''}`,
+		`- 予定: ${describeSchedule(reminderToSchedule(reminder))}`,
+	];
+	if (reminder.pre_notify_minutes) {
+		lines.push(`- 事前通知: ${reminder.pre_notify_minutes}分前`);
+	}
+	if (reminder.nag_interval_minutes) {
+		lines.push(`- 完了まで再通知: ${reminder.nag_interval_minutes}分おき・最大${reminder.nag_max_count ?? 1}回`);
+	}
+	if (reminder.next_run_at !== null && reminder.status === 'active') {
+		lines.push(
+			`- 次回: ${discordTimestamp(reminder.next_run_at, 'F')}（${discordTimestamp(reminder.next_run_at, 'R')}）`,
+		);
+	}
+	if (reminder.status === 'error' && reminder.last_error) {
+		lines.push(`- エラー: ${truncate(reminder.last_error, 200)}`);
 	}
 	return lines.join('\n');
 }

@@ -4,8 +4,11 @@ import {
 	allConditions,
 	cancelPendingJobsStatement,
 	type ExtraCondition,
+	getReminder,
 	guardCondition,
 	insertJobStatement,
+	insertReminder,
+	type ReminderInput,
 	type ReminderRow,
 	type ReminderUpdate,
 	updateReminderStatement,
@@ -145,4 +148,38 @@ export function cancelUpcomingStatement(db: ReminderDb, reminderId: number, now:
 /** 未送信の本通知・事前通知を取り消す (編集・一時停止・削除時) */
 export async function cancelUpcoming(db: ReminderDb, reminderId: number, now: number): Promise<void> {
 	await cancelUpcomingStatement(db, reminderId, now).run();
+}
+
+export type CreateReminderResult =
+	| { ok: true; reminder: ReminderRow; occurrence: Occurrence }
+	| { ok: false; message: string };
+
+/**
+ * リマインダを登録し、最初の通知ジョブを作る。
+ * 条件に合う通知日時がない場合は登録せずにエラーを返す。
+ */
+export async function createReminder(db: ReminderDb, input: ReminderInput, now: number): Promise<CreateReminderResult> {
+	const draft: ReminderRow = {
+		...input,
+		id: 0,
+		status: 'active',
+		last_error: null,
+		next_run_at: null,
+		created_at: now,
+		updated_at: now,
+	};
+	if (!computeNextOccurrence(reminderToSchedule(draft), now)) {
+		return { ok: false, message: '条件に合う通知日時がありません。日時・繰り返し・終了日を確認してください。' };
+	}
+
+	const id = await insertReminder(db, input, now);
+	const reminder = await getReminder(db, id);
+	if (!reminder) {
+		throw new Error(`Reminder ${id} disappeared`);
+	}
+	const occurrence = await scheduleUpcoming(db, reminder, now, now);
+	if (!occurrence) {
+		throw new Error(`Reminder ${id} has no occurrence`);
+	}
+	return { ok: true, reminder: { ...reminder, next_run_at: occurrence.runAt }, occurrence };
 }
