@@ -160,14 +160,16 @@ export const reminderDoneComponent = factory.component(makeButton(DONE_BUTTON_ID
 		return c.flags('EPHEMERAL').res(target.message);
 	}
 	const now = Date.now();
-	if (!(await closeOccurrence(db, target.occurrence.id, 'completed', { by: target.userId, now }))) {
-		return c.flags('EPHEMERAL').res(MESSAGES.closed);
-	}
+	// 先に未送信の再通知・スヌーズを取り消してから完了にする。
+	// 取り消しで失敗した場合は回が open のまま残るため、再度押せば最後まで完了できる
 	await cancelPendingJobs(
 		db,
 		{ reminderId: target.reminder.id, occurrenceId: target.occurrence.id, kinds: [...CANCELLED_KINDS_ON_ACTION] },
 		now,
 	);
+	if (!(await closeOccurrence(db, target.occurrence.id, 'completed', { by: target.userId, now }))) {
+		return c.flags('EPHEMERAL').res(MESSAGES.closed);
+	}
 	return c.update().res({
 		content: withStatusLine(
 			c.interaction.message?.content ?? '',

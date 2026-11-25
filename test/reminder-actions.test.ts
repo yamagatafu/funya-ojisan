@@ -208,6 +208,37 @@ describe('reminder action buttons', () => {
 			expect(body.data.content).toBe(`${MESSAGE_CONTENT}\n-# ✅ <@${OWNER_ID}> が完了しました（09:03）`);
 		});
 
+		it('keeps body lines that look like status lines', async () => {
+			const { db, occurrenceId } = await setup();
+			const body = `⏰ <@${OWNER_ID}> リマインド\n-# ✅ 確認済み\n-# ⏰ 09:00 集合\n-# #1 · <@${OWNER_ID}> · 毎日 09:00`;
+			const interaction = buttonInteraction(`remind_done;${occurrenceId}`, occurrenceId);
+			interaction.message.content = `${body}\n-# ⏰ <@${OWNER_ID}> が 09:05 に再通知を予約しました`;
+
+			const response = await send(db, interaction);
+
+			expect(response.data.content).toBe(`${body}\n-# ✅ <@${OWNER_ID}> が完了しました（09:03）`);
+		});
+
+		it('stays open when cancelling jobs fails, so that it can be completed on retry', async () => {
+			const { db, occurrenceId, nagJobId } = await setup();
+			const originalPrepare = db.prepare.bind(db);
+			const prepareSpy = vi.spyOn(db, 'prepare').mockImplementation((query: string) => {
+				if (query.startsWith("UPDATE reminder_jobs SET status = 'cancelled'")) {
+					throw new Error('D1 unavailable');
+				}
+				return originalPrepare(query);
+			});
+
+			await send(db, buttonInteraction(`remind_done;${occurrenceId}`, occurrenceId)).catch(() => undefined);
+			expect((await getOccurrence(db, occurrenceId))?.state).toBe('open');
+
+			prepareSpy.mockRestore();
+			const body = await send(db, buttonInteraction(`remind_done;${occurrenceId}`, occurrenceId));
+			expect(body.data.content).toContain('が完了しました');
+			expect((await getOccurrence(db, occurrenceId))?.state).toBe('completed');
+			expect(jobs(db).find((job) => job.id === nagJobId)?.status).toBe('cancelled');
+		});
+
 		it('reports an already completed occurrence', async () => {
 			const { db, occurrenceId, nagJobId } = await setup();
 			await closeOccurrence(db, occurrenceId, 'completed', { by: OTHER_ID, now: NOW - MINUTE_MS });
@@ -236,7 +267,8 @@ describe('reminder action buttons', () => {
 
 			expectEphemeral(body, 'この通知はすでに完了または終了しています。');
 			expect(await getOccurrence(db, occurrenceId)).toMatchObject({ state: 'superseded', completed_by: null });
-			expect(jobs(db).find((job) => job.id === nagJobId)?.status).toBe('pending');
+			// 取り消しは完了の判定より先に行う。競合相手 (置き換え・別の完了操作) も同じジョブを取り消すため整合する
+			expect(jobs(db).find((job) => job.id === nagJobId)?.status).toBe('cancelled');
 		});
 
 		it('reports a deleted reminder', async () => {
