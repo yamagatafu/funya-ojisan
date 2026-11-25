@@ -446,8 +446,8 @@ export function buildScheduleForRelative(opts: RelativeOptionValues, nowMs: numb
 	if (total > MAX_RELATIVE_MINUTES) {
 		return fail('365 日以内で指定してください。');
 	}
-	// 分単位の精度のため、秒以下は切り捨てる
-	const onceAt = Math.floor((nowMs + total * MINUTE_MS) / MINUTE_MS) * MINUTE_MS;
+	// 分単位の精度にそろえる。指定した時間より前に通知しないよう、秒以下は切り上げる
+	const onceAt = Math.ceil((nowMs + total * MINUTE_MS) / MINUTE_MS) * MINUTE_MS;
 	return {
 		ok: true,
 		value: {

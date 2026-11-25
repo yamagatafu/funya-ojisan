@@ -2,7 +2,7 @@ import { ApplicationCommandOptionType, ChannelType, InteractionType } from 'disc
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { reminderCommandHandlers } from '../src/handlers/reminder-commands.ts';
 import { jstToUtcMs, MINUTE_MS } from '../src/reminder/date.ts';
-import { buildScheduleForAdd, buildScheduleForEdit } from '../src/reminder/options.ts';
+import { buildScheduleForAdd, buildScheduleForEdit, buildScheduleForRelative } from '../src/reminder/options.ts';
 import {
 	getReminder,
 	insertOccurrence,
@@ -414,6 +414,12 @@ describe('/remind add', () => {
 });
 
 describe('/remind in', () => {
+	it('does not notify before the requested duration when run in the middle of a minute', () => {
+		// 08:00:59 に 1 分後を指定すると、08:01:59 を切り上げた 08:02:00 に通知する
+		const result = buildScheduleForRelative({ minutes: 1 }, NOW + 59 * 1000);
+		expect(result).toMatchObject({ ok: true, value: { once_at: NOW + 2 * MINUTE_MS } });
+	});
+
 	it('registers a once reminder relative to now', async () => {
 		const db = createTestDb();
 		const content = await run(db, 'in', [opt('content', 'お湯'), opt('hours', 1), opt('minutes', 30)]);
