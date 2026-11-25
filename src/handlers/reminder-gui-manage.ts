@@ -58,7 +58,11 @@ function notFound(id: number): string {
 type ToggleAction = 'pause' | 'resume';
 
 function parseToggleValue(value: string | undefined): { id: number; action: ToggleAction } | null {
-	const [idValue, action] = (value ?? '').split(':');
+	const parts = (value ?? '').split(':');
+	if (parts.length !== 2) {
+		return null;
+	}
+	const [idValue, action] = parts;
 	const id = parseReminderId(idValue);
 	if (id === null || (action !== 'pause' && action !== 'resume')) {
 		return null;
@@ -209,7 +213,8 @@ export const manageToggleComponent = factory.component(
 			return c.flags('EPHEMERAL').res(replyData(prepared.ok ? MESSAGES.invalid : prepared.message));
 		}
 		const { inv } = prepared;
-		if (!(await findManageableReminder(inv))) {
+		const before = await findManageableReminder(inv);
+		if (!before) {
 			return c.flags('EPHEMERAL').res(replyData(notFound(toggle.id)));
 		}
 		let reply: Reply;
@@ -225,9 +230,9 @@ export const manageToggleComponent = factory.component(
 		}
 		// 結果の本文に、新しい状態に合わせた操作ボタンを付け直す (権限不足などで失敗した場合も操作を続けられるように)
 		const saved = await findManageableReminder(inv);
-		return c
-			.update()
-			.res(replyData({ message: { content: reply, components: saved ? buildManageButtons(saved) : [] } }));
+		// 状態が変わらなかった (権限不足などで失敗した) 場合は、案内の下にリマインダの要約を残す
+		const content = saved && saved.status === before.status ? `${reply}\n\n${manageView(saved).content}` : reply;
+		return c.update().res(replyData({ message: { content, components: saved ? buildManageButtons(saved) : [] } }));
 	},
 );
 

@@ -282,7 +282,7 @@ describe('リマインダの選択', () => {
 });
 
 describe('[基本設定を編集]', () => {
-	it('現在の種類を選択済みにした繰り返しの選択メニューを表示する', async () => {
+	it('現在の種類をプレースホルダーに示した繰り返しの選択メニューを表示する', async () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
 
@@ -292,7 +292,9 @@ describe('[基本設定を編集]', () => {
 		expect(body.data?.content).toContain('繰り返しを選んでください');
 		const [[menu]] = rows(body);
 		expect(menu?.custom_id).toBe(`${EDIT_REPEAT_SELECT_ID};${reminder.id}`);
-		expect(menu?.options?.filter((option) => option.default).map((option) => option.value)).toEqual(['weekly']);
+		// default にすると同じ種類を選び直せないため、現在の種類はプレースホルダーに出す
+		expect(menu?.placeholder).toBe('繰り返しを選んでください（現在: 毎週）');
+		expect(menu?.options?.some((option) => option.default)).toBe(false);
 	});
 
 	it('操作できない人・別のサーバーは拒否する', async () => {
@@ -344,7 +346,17 @@ describe('[一時停止] / [再開]', () => {
 			button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:resume`, { permissions: String(1n << 10n) }),
 		);
 		expect(body.data?.content).toContain('投稿する権限');
+		// 失敗した場合も、案内の下にリマインダの要約を残す
+		expect(body.data?.content).toContain(`📌 リマインダ #${reminder.id}`);
 		expect((await getReminder(db, reminder.id))?.status).toBe('paused');
+	});
+
+	it('不正な操作の値は拒否する', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db);
+		const body = await send(db, button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:pause:extra`));
+		expect(body.data?.flags).toBe(64);
+		expect((await getReminder(db, reminder.id))?.status).toBe('active');
 	});
 
 	it('操作できない人・別のサーバー・不正な値は拒否する', async () => {
