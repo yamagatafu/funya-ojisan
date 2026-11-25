@@ -1,5 +1,7 @@
 import {
+	type APIActionRowComponent,
 	type APIAllowedMentions,
+	type APIComponentInMessageActionRow,
 	type APIInteractionDataResolved,
 	type APIInteractionGuildMember,
 	PermissionFlagsBits,
@@ -17,6 +19,7 @@ import { factory } from '../factory.ts';
 import type { Rest } from '../reminder/dispatcher.ts';
 import { removeButtons } from '../reminder/dispatcher.ts';
 import { describeSchedule, discordTimestamp, truncate } from '../reminder/format.ts';
+import { buildDetailButtons, buildRepeatSelect, NEW_REPEAT_SELECT_ID } from '../reminder/gui.ts';
 import { buildReminderSummary, statusLabel } from '../reminder/message.ts';
 import {
 	buildScheduleForAdd,
@@ -146,6 +149,7 @@ export const remindCommandDefinition = makeSlashCommand('remind', 'リマイン�
 			makeStringOption('time', '時刻（HH:MM）').required(true),
 			...scheduleOptions('add'),
 		]),
+		makeSubCommand('new', '入力画面 (GUI) でリマインダを登録します'),
 		makeSubCommand('in', '指定した時間が経ったら 1 回だけリマインドします').options([
 			contentOption(true),
 			makeIntegerOption('minutes', '何分後か').min_value(0).max_value(MAX_RELATIVE_MINUTES),
@@ -175,7 +179,7 @@ export const remindCommandDefinition = makeSlashCommand('remind', 'リマイン�
 // ---- 共通処理 ----
 
 /** 全サブコマンドのオプション (Discord から受け取った値) */
-interface RemindOptions extends ScheduleOptionValues {
+export interface RemindOptions extends ScheduleOptionValues {
 	id?: number;
 	content?: string;
 	channel?: string;
@@ -186,7 +190,7 @@ interface RemindOptions extends ScheduleOptionValues {
 	all?: boolean;
 }
 
-interface Invocation {
+export interface Invocation {
 	db: ReminderDb;
 	now: number;
 	guildId: string;
@@ -199,7 +203,64 @@ interface Invocation {
 }
 
 /** 即時に返す応答か、遅延応答 (REST を使う処理の後に返す) */
-type Reply = string | { deferred: (rest: Rest) => Promise<string> };
+/** ボタンや選択メニューを含む応答 */
+export interface ReplyMessage {
+	content: string;
+	components?: APIActionRowComponent<APIComponentInMessageActionRow>[];
+}
+
+/** 即時に返す応答 (文字列またはメッセージ) か、遅延応答 (REST を使う処理の後に返す) */
+export type Reply = string | { message: ReplyMessage } | { deferred: (rest: Rest) => Promise<string> };
+
+/** Ephemeral 応答の本文 (メンションは通知しない) */
+export function replyData(
+	reply: string | { message: ReplyMessage },
+): ReplyMessage & { allowed_mentions: APIAllowedMentions } {
+	return typeof reply === 'string'
+		? { content: reply, allowed_mentions: { parse: [] } }
+		: { ...reply.message, allowed_mentions: { parse: [] } };
+}
+
+/** 登録・編集の結果の要約に、詳細設定 ([通知設定] [期間・祝日]) を開くボタンを付ける */
+function summaryWithDetailButtons(reminder: ReminderRow, heading: string): Reply {
+	return {
+		message: { content: buildReminderSummary(reminder, heading), components: [buildDetailButtons(reminder)] },
+	};
+}
+
+/**
+ * インタラクション (コマンド・ボタン・選択メニュー・モーダル) から Invocation を組み立てる。
+ * サーバー外のインタラクションの場合は null
+ */
+export function buildInvocation(params: {
+	db: ReminderDb;
+	interaction: {
+		guild_id?: string;
+		member?: APIInteractionGuildMember;
+		channel?: { id: string; type: number };
+		channel_id?: string;
+		app_permissions: string;
+	};
+	resolved: APIInteractionDataResolved | undefined;
+	opts: RemindOptions;
+	now?: number;
+}): Invocation | null {
+	const { interaction } = params;
+	if (!interaction.member || !interaction.guild_id) {
+		return null;
+	}
+	return {
+		db: params.db,
+		now: params.now ?? Date.now(),
+		guildId: interaction.guild_id,
+		actor: actorOf(interaction.member),
+		channelId: interaction.channel?.id ?? interaction.channel_id,
+		channelType: interaction.channel?.type,
+		appPermissions: interaction.app_permissions,
+		resolved: params.resolved,
+		opts: params.opts,
+	};
+}
 
 /** コマンドのオプション値を型を確認しながら取り出す (想定外の型の値は未指定として扱う) */
 function decodeRemindOptions(vars: Readonly<Record<string, unknown>>): RemindOptions {
@@ -248,7 +309,7 @@ function notFound(id: number | undefined): string {
 }
 
 /** 操作できるリマインダを取得する (他のギルドのもの・権限がないものは見つからない扱い) */
-async function findManageableReminder(inv: Invocation): Promise<ReminderRow | null> {
+export async function findManageableReminder(inv: Invocation): Promise<ReminderRow | null> {
 	if (inv.opts.id === undefined) {
 		return null;
 	}
@@ -313,7 +374,7 @@ function resolveTargetAndMention(
 	};
 }
 
-async function register(inv: Invocation, content: string | undefined, schedule: ScheduleFields): Promise<string> {
+async function register(inv: Invocation, content: string | undefined, schedule: ScheduleFields): Promise<Reply> {
 	const normalized = normalizeContent(content);
 	if (!normalized.ok) {
 		return normalized.message;
@@ -341,12 +402,12 @@ async function register(inv: Invocation, content: string | undefined, schedule: 
 	if (!result.ok) {
 		return result.message;
 	}
-	return buildReminderSummary(result.reminder, `✅ リマインダ #${result.reminder.id} を登録しました`);
+	return summaryWithDetailButtons(result.reminder, `✅ リマインダ #${result.reminder.id} を登録しました`);
 }
 
 // ---- サブコマンド ----
 
-async function handleAdd(inv: Invocation): Promise<Reply> {
+export async function handleAdd(inv: Invocation): Promise<Reply> {
 	const schedule = buildScheduleForAdd(inv.opts, inv.now);
 	if (!schedule.ok) {
 		return schedule.message;
@@ -391,7 +452,7 @@ function conflictMessage(id: number): string {
 	return `リマインダ #${id} は他の操作 (通知・編集など) と同時に更新されたため、変更を保存できませんでした。もう一度実行してください。`;
 }
 
-async function handleEdit(inv: Invocation): Promise<Reply> {
+export async function handleEdit(inv: Invocation): Promise<Reply> {
 	const reminder = await findManageableReminder(inv);
 	if (!reminder) {
 		return notFound(inv.opts.id);
@@ -518,7 +579,7 @@ async function handleEdit(inv: Invocation): Promise<Reply> {
 		}
 		return conflictMessage(reminder.id);
 	}
-	return buildReminderSummary(saved, `✏️ リマインダ #${reminder.id} を更新しました`);
+	return summaryWithDetailButtons(saved, `✏️ リマインダ #${reminder.id} を更新しました`);
 }
 
 function listLine(reminder: ReminderRow, showOwner: boolean): string {
@@ -534,7 +595,7 @@ function listLine(reminder: ReminderRow, showOwner: boolean): string {
 	return `- ${parts.join(' · ')}`;
 }
 
-async function handleList(inv: Invocation): Promise<Reply> {
+export async function handleList(inv: Invocation): Promise<Reply> {
 	const all = inv.opts.all === true;
 	if (all && !isServerManager(inv.actor)) {
 		return 'all を指定できるのはサーバーの管理権限を持つメンバーのみです。';
@@ -570,7 +631,7 @@ async function handleList(inv: Invocation): Promise<Reply> {
 	return lines.join('\n');
 }
 
-async function handleDelete(inv: Invocation): Promise<Reply> {
+export async function handleDelete(inv: Invocation): Promise<Reply> {
 	const reminder = await findManageableReminder(inv);
 	if (!reminder) {
 		return notFound(inv.opts.id);
@@ -598,7 +659,7 @@ async function handleDelete(inv: Invocation): Promise<Reply> {
 	};
 }
 
-async function handlePause(inv: Invocation): Promise<Reply> {
+export async function handlePause(inv: Invocation): Promise<Reply> {
 	const reminder = await findManageableReminder(inv);
 	if (!reminder) {
 		return notFound(inv.opts.id);
@@ -614,7 +675,7 @@ async function handlePause(inv: Invocation): Promise<Reply> {
 	return buildReminderSummary(saved, `⏸️ リマインダ #${reminder.id} を一時停止しました`);
 }
 
-async function handleResume(inv: Invocation): Promise<Reply> {
+export async function handleResume(inv: Invocation): Promise<Reply> {
 	const reminder = await findManageableReminder(inv);
 	if (!reminder) {
 		return notFound(inv.opts.id);
@@ -648,7 +709,18 @@ async function handleResume(inv: Invocation): Promise<Reply> {
 	return buildReminderSummary(saved, `▶️ リマインダ #${reminder.id} を再開しました`);
 }
 
+/** /remind new: GUI での登録を始める (繰り返しの種類を選ぶ選択メニューを返す) */
+async function handleNew(_inv: Invocation): Promise<Reply> {
+	return {
+		message: {
+			content: '📝 リマインダの繰り返しを選んでください。選ぶと入力画面が開きます。',
+			components: [buildRepeatSelect(NEW_REPEAT_SELECT_ID)],
+		},
+	};
+}
+
 const SUBCOMMANDS: Record<string, (inv: Invocation) => Promise<Reply>> = {
+	new: handleNew,
 	add: handleAdd,
 	in: handleIn,
 	edit: handleEdit,
@@ -726,17 +798,15 @@ export const remindCommand = factory.autocomplete(
 		}
 
 		const data = c.interaction.data;
-		const invocation: Invocation = {
+		const invocation = buildInvocation({
 			db,
-			now: Date.now(),
-			guildId,
-			actor: actorOf(member),
-			channelId: c.interaction.channel?.id ?? c.interaction.channel_id,
-			channelType: c.interaction.channel?.type,
-			appPermissions: c.interaction.app_permissions,
+			interaction: c.interaction,
 			resolved: 'resolved' in data ? data.resolved : undefined,
 			opts: decodeRemindOptions(c.var),
-		};
+		});
+		if (!invocation) {
+			return ephemeral.res({ content: 'このコマンドはサーバー内でのみ使用できます。' });
+		}
 
 		let reply: Reply;
 		try {
@@ -745,8 +815,8 @@ export const remindCommand = factory.autocomplete(
 			console.error(`Unexpected error in /remind ${c.sub.command}:`, error);
 			return ephemeral.res({ content: 'エラーが発生しました。時間をおいて再度お試しください。' });
 		}
-		if (typeof reply === 'string') {
-			return ephemeral.res({ content: reply, ...RESPONSE_OPTIONS });
+		if (typeof reply === 'string' || 'message' in reply) {
+			return ephemeral.res(replyData(reply));
 		}
 		const { deferred } = reply;
 		return ephemeral.resDefer(async (d) => {
