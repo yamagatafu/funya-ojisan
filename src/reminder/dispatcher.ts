@@ -4,11 +4,9 @@ import type { DbStatement, ReminderDb } from '../types.ts';
 import { MINUTE_MS } from './date.ts';
 import { buildNotification, buildPreNotification, type MessagePayload } from './message.ts';
 import {
-	cancelPendingJobs,
 	cancelPendingJobsStatement,
 	claimJob,
 	cleanupExpired,
-	closeOccurrence,
 	closeOccurrenceStatement,
 	findDueJobs,
 	getOccurrence,
@@ -24,7 +22,6 @@ import {
 	updateJobStatement,
 	updateOccurrence,
 	updateOccurrenceStatement,
-	updateReminder,
 	updateReminderStatement,
 } from './repository.ts';
 import { planUpcoming } from './service.ts';
@@ -62,14 +59,26 @@ async function retryAfterMs(response: { headers: Headers; json(): Promise<unknow
 	return RETRY_DELAY_MS;
 }
 
-export async function postMessage(rest: Rest, channelId: string, payload: MessagePayload): Promise<SendOutcome> {
+/** ジョブごとの nonce。Discord は同じ nonce の投稿を数分間 1 件にまとめるため、再試行時の二重投稿を防げる */
+export function jobNonce(jobId: number): string {
+	return `reminder-job-${jobId}`;
+}
+
+export async function postMessage(
+	rest: Rest,
+	channelId: string,
+	payload: MessagePayload,
+	nonce?: string,
+): Promise<SendOutcome> {
 	let response: Awaited<ReturnType<Rest>>;
 	try {
 		response = await rest(
 			'POST',
 			$channels$_$messages,
 			[channelId],
-			payload as unknown as RESTPostAPIChannelMessageJSONBody,
+			(nonce
+				? { ...payload, nonce, enforce_nonce: true }
+				: payload) as unknown as RESTPostAPIChannelMessageJSONBody,
 		);
 	} catch (error) {
 		return { type: 'transient', detail: String(error) };
@@ -114,50 +123,81 @@ async function finishJob(ctx: DispatchContext, job: JobRow, status: 'sent' | 'ca
 	await updateJob(ctx.db, job.id, { status }, ctx.now());
 }
 
+/**
+ * ジョブを諦める。状態の更新は 1 つの batch で行う。
+ * - 恒久エラー、または本通知を諦める場合は、リマインダを error にして以降の送信を止める
+ *   (有効なまま予定のないリマインダを残さず、/remind list で気付けるようにする)
+ * - それ以外 (事前通知・再通知・スヌーズの一時的な失敗) は、そのジョブだけを failed にする
+ * batch が失敗した場合は例外を投げる。呼び出し側はジョブを再試行できる状態に戻すこと。
+ */
+async function giveUp(
+	ctx: DispatchContext,
+	job: JobRow,
+	params: { detail: string; disableReminder: boolean; occurrenceId: number | null },
+): Promise<void> {
+	const now = ctx.now();
+	const attempts = job.attempt_count + 1;
+	const disable = params.disableReminder || job.kind === 'main';
+	console.error(
+		`[ALERT] Reminder job given up${disable ? ' and reminder disabled' : ''}: jobId=${job.id}, reminderId=${job.reminder_id}, attempts=${attempts}, ${params.detail}`,
+	);
+	await ctx.db.batch(
+		compact([
+			updateJobStatement(ctx.db, job.id, { status: 'failed', attempt_count: attempts }, now),
+			disable
+				? updateReminderStatement(
+						ctx.db,
+						job.reminder_id,
+						{ status: 'error', last_error: params.detail.slice(0, 500), next_run_at: null },
+						now,
+					)
+				: null,
+			disable ? cancelPendingJobsStatement(ctx.db, { reminderId: job.reminder_id }, now) : null,
+			disable && params.occurrenceId !== null
+				? closeOccurrenceStatement(ctx.db, params.occurrenceId, 'superseded', { now })
+				: null,
+		]),
+	);
+}
+
+/** ジョブを再試行できる状態に戻す */
+async function retryLater(ctx: DispatchContext, job: JobRow, delayMs: number, countAttempt: boolean): Promise<void> {
+	const now = ctx.now();
+	await updateJob(
+		ctx.db,
+		job.id,
+		{
+			status: 'pending',
+			run_at: now + delayMs,
+			attempt_count: countAttempt ? job.attempt_count + 1 : job.attempt_count,
+		},
+		now,
+	);
+}
+
 async function handleSendFailure(
 	ctx: DispatchContext,
 	job: JobRow,
-	reminder: ReminderRow,
 	outcome: Exclude<SendOutcome, { type: 'ok' }>,
 	occurrenceId: number | null,
 ): Promise<void> {
-	const now = ctx.now();
 	switch (outcome.type) {
 		case 'rate_limited':
-			await updateJob(ctx.db, job.id, { status: 'pending', run_at: now + outcome.retryAfterMs }, now);
+			await retryLater(ctx, job, outcome.retryAfterMs, false);
 			return;
-		case 'transient': {
-			const attempts = job.attempt_count + 1;
-			if (attempts >= MAX_ATTEMPTS) {
-				console.error(
-					`[ALERT] Reminder job failed after ${attempts} attempts: jobId=${job.id}, reminderId=${reminder.id}, ${outcome.detail}`,
-				);
-				await updateJob(ctx.db, job.id, { status: 'failed', attempt_count: attempts }, now);
+		case 'transient':
+			if (job.attempt_count + 1 >= MAX_ATTEMPTS) {
+				await giveUp(ctx, job, { detail: outcome.detail, disableReminder: false, occurrenceId });
 				return;
 			}
-			console.error(`Reminder job failed transiently (attempt ${attempts}): jobId=${job.id}, ${outcome.detail}`);
-			await updateJob(
-				ctx.db,
-				job.id,
-				{ status: 'pending', run_at: now + RETRY_DELAY_MS, attempt_count: attempts },
-				now,
+			console.error(
+				`Reminder job failed transiently (attempt ${job.attempt_count + 1}): jobId=${job.id}, ${outcome.detail}`,
 			);
+			await retryLater(ctx, job, RETRY_DELAY_MS, true);
 			return;
-		}
 		case 'permanent':
-			// チャンネル削除・権限不足など。リマインダを error にして以降の送信を止める
-			console.error(`[ALERT] Reminder disabled due to send error: reminderId=${reminder.id}, ${outcome.detail}`);
-			await updateJob(ctx.db, job.id, { status: 'failed', attempt_count: job.attempt_count + 1 }, now);
-			await updateReminder(
-				ctx.db,
-				reminder.id,
-				{ status: 'error', last_error: outcome.detail, next_run_at: null },
-				now,
-			);
-			await cancelPendingJobs(ctx.db, { reminderId: reminder.id }, now);
-			if (occurrenceId !== null) {
-				await closeOccurrence(ctx.db, occurrenceId, 'superseded', { now });
-			}
+			// チャンネル削除・権限不足など
+			await giveUp(ctx, job, { detail: outcome.detail, disableReminder: true, occurrenceId });
 			return;
 	}
 }
@@ -168,11 +208,16 @@ async function processPreJob(ctx: DispatchContext, job: JobRow, reminder: Remind
 		await finishJob(ctx, job, 'cancelled');
 		return;
 	}
-	const outcome = await postMessage(ctx.rest, reminder.channel_id, buildPreNotification(reminder, job.scheduled_at));
+	const outcome = await postMessage(
+		ctx.rest,
+		reminder.channel_id,
+		buildPreNotification(reminder, job.scheduled_at),
+		jobNonce(job.id),
+	);
 	if (outcome.type === 'ok') {
 		await finishJob(ctx, job, 'sent');
 	} else {
-		await handleSendFailure(ctx, job, reminder, outcome, null);
+		await handleSendFailure(ctx, job, outcome, null);
 	}
 }
 
@@ -260,9 +305,10 @@ async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: Remin
 				scheduledAt: job.scheduled_at,
 				now: ctx.now(),
 			}),
+			jobNonce(job.id),
 		);
 		if (outcome.type !== 'ok') {
-			await handleSendFailure(ctx, job, reminder, outcome, occurrence.id);
+			await handleSendFailure(ctx, job, outcome, occurrence.id);
 			return;
 		}
 		await updateOccurrence(ctx.db, occurrence.id, { last_message_id: outcome.messageId });
@@ -298,7 +344,8 @@ async function processMainJob(ctx: DispatchContext, job: JobRow, reminder: Remin
 
 async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: ReminderRow): Promise<void> {
 	const occurrence = job.occurrence_id !== null ? await getOccurrence(ctx.db, job.occurrence_id) : null;
-	if (occurrence?.state !== 'open') {
+	// error のリマインダ (送信先に投稿できない) には送らない。ended は開いている回の再通知が必要なため送る
+	if (occurrence?.state !== 'open' || reminder.status === 'error') {
 		await finishJob(ctx, job, 'cancelled');
 		return;
 	}
@@ -324,9 +371,10 @@ async function processFollowUpJob(ctx: DispatchContext, job: JobRow, reminder: R
 				nagIndex: nagCount,
 				now: ctx.now(),
 			}),
+			jobNonce(job.id),
 		);
 		if (outcome.type !== 'ok') {
-			await handleSendFailure(ctx, job, reminder, outcome, null);
+			await handleSendFailure(ctx, job, outcome, null);
 			return;
 		}
 		messageId = outcome.messageId;
@@ -386,15 +434,19 @@ export async function dispatchDueJobs(params: { db: ReminderDb; rest: Rest; now?
 				await processJob(ctx, job);
 			} catch (error) {
 				console.error(`Unexpected error while processing reminder job ${job.id}:`, error);
-				const attempts = job.attempt_count + 1;
-				await updateJob(
-					ctx.db,
-					job.id,
-					attempts >= MAX_ATTEMPTS
-						? { status: 'failed', attempt_count: attempts }
-						: { status: 'pending', run_at: ctx.now() + RETRY_DELAY_MS, attempt_count: attempts },
-					ctx.now(),
-				).catch((updateError) => console.error('Failed to record job failure:', updateError));
+				try {
+					if (job.attempt_count + 1 >= MAX_ATTEMPTS) {
+						await giveUp(ctx, job, { detail: String(error), disableReminder: false, occurrenceId: null });
+					} else {
+						await retryLater(ctx, job, RETRY_DELAY_MS, true);
+					}
+				} catch (recordError) {
+					// 状態の確定に失敗した場合は、再試行できる状態に戻す (ロールバック済みのため不整合は残らない)
+					console.error('Failed to record job failure:', recordError);
+					await retryLater(ctx, job, RETRY_DELAY_MS, true).catch((retryError) =>
+						console.error('Failed to reschedule job:', retryError),
+					);
+				}
 			}
 		}
 		if (!claimedAny || jobs.length < BATCH_SIZE) {

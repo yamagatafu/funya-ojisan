@@ -12,6 +12,7 @@ import {
 	type ReminderInput,
 } from '../src/reminder/repository.ts';
 import { scheduleUpcoming } from '../src/reminder/service.ts';
+import type { DbStatement } from '../src/types.ts';
 import { createTestDb } from './helpers/d1.ts';
 
 const CHANNEL_ID = '200000000000000000';
@@ -81,6 +82,34 @@ function calls(fetchMock: ReturnType<typeof mockDiscord>) {
 		url: String(url),
 		body: init?.body ? JSON.parse(String(init.body)) : undefined,
 	}));
+}
+
+/** 条件に一致する SQL 文だけを実行時に失敗させる (batch の途中での失敗を再現する) */
+function failStatements(
+	db: ReturnType<typeof createTestDb>,
+	predicate: (query: string, values: unknown[]) => boolean,
+	times = 1,
+) {
+	const originalPrepare = db.prepare.bind(db);
+	let remaining = times;
+	const wrap = (query: string, statement: DbStatement, values: unknown[]): DbStatement => {
+		const shouldFail = () => remaining > 0 && predicate(query, values) && remaining-- > 0;
+		const failing = <T>(run: () => T): T => {
+			if (shouldFail()) {
+				throw new Error('D1 statement failed');
+			}
+			return run();
+		};
+		const raw = statement as DbStatement & { execute(): unknown };
+		return {
+			bind: (...next: unknown[]) => wrap(query, statement.bind(...next), next),
+			first: (() => failing(() => statement.first())) as DbStatement['first'],
+			all: (() => failing(() => statement.all())) as DbStatement['all'],
+			run: () => failing(() => statement.run()),
+			execute: () => failing(() => raw.execute()),
+		} as DbStatement;
+	};
+	return vi.spyOn(db, 'prepare').mockImplementation((query: string) => wrap(query, originalPrepare(query), []));
 }
 
 const rest = createRest('test-token');
@@ -322,6 +351,102 @@ describe('dispatchDueJobs', () => {
 		db.raw.exec(
 			`INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state, last_message_id, nag_count) VALUES (${id}, ${now}, 'open', 'msg-x', 1)`,
 		);
+		db.raw.exec("UPDATE reminder_jobs SET status = 'cancelled' WHERE kind = 'main'");
+		await insertJob(db, { reminderId: id, occurrenceId: 1, kind: 'nag', runAt: now, scheduledAt: now }, now);
+		const fetchMock = mockDiscord();
+
+		await dispatchDueJobs({ db, rest, now: () => now });
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(jobs(db).find((job) => job.kind === 'nag')?.status).toBe('cancelled');
+	});
+
+	it('rolls back the whole post-send batch when a later statement fails', async () => {
+		const { db, id } = await setup({ remaining_count: 3, nag_interval_minutes: 30, nag_max_count: 2 });
+		const fetchMock = mockDiscord();
+		const now = jstToUtcMs('2026-11-25', 9 * 60);
+		// 次回ジョブの登録・残り回数の更新などを実行した後、最後のジョブ完了の更新で失敗させる
+		const spy = failStatements(
+			db,
+			(query, values) => query.startsWith('UPDATE reminder_jobs SET status') && values[0] === 'sent',
+		);
+
+		await dispatchDueJobs({ db, rest, now: () => now });
+		spy.mockRestore();
+
+		expect((await getReminder(db, id))?.remaining_count).toBe(3);
+		expect(jobs(db).map((job) => [job.kind, job.status, job.attempt_count])).toEqual([['main', 'pending', 1]]);
+
+		await dispatchDueJobs({ db, rest, now: () => now + MINUTE_MS });
+
+		expect(calls(fetchMock).filter((call) => call.method === 'POST')).toHaveLength(1);
+		expect((await getReminder(db, id))?.remaining_count).toBe(2);
+		expect(jobs(db).map((job) => [job.kind, job.status])).toEqual([
+			['main', 'sent'],
+			['nag', 'pending'],
+			['main', 'pending'],
+		]);
+	});
+
+	it('sends with a per-job nonce so that Discord deduplicates a resend after a crash', async () => {
+		const { db } = await setup({ nag_interval_minutes: 10, nag_max_count: 1 });
+		const fetchMock = mockDiscord();
+		const start = jstToUtcMs('2026-11-25', 9 * 60);
+		await dispatchDueJobs({ db, rest, now: () => start });
+
+		// 再通知の送信後、メッセージ ID の記録に失敗した状況を再現する
+		const spy = failStatements(db, (query) => query.startsWith('UPDATE reminder_jobs SET sent_message_id'));
+		await dispatchDueJobs({ db, rest, now: () => start + 10 * MINUTE_MS });
+		spy.mockRestore();
+		await dispatchDueJobs({ db, rest, now: () => start + 11 * MINUTE_MS });
+
+		const posts = calls(fetchMock).filter((call) => call.method === 'POST');
+		expect(posts.map((call) => [call.body.nonce, call.body.enforce_nonce])).toEqual([
+			['reminder-job-1', true],
+			['reminder-job-2', true],
+			['reminder-job-2', true],
+		]);
+	});
+
+	it('keeps the job retryable when recording a permanent error fails', async () => {
+		const { db, id } = await setup();
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"message":"Missing Access"}', { status: 403 }));
+		const now = jstToUtcMs('2026-11-25', 9 * 60);
+		const spy = failStatements(db, (query) => query.startsWith('UPDATE reminders SET status'));
+
+		await dispatchDueJobs({ db, rest, now: () => now });
+		spy.mockRestore();
+
+		expect((await getReminder(db, id))?.status).toBe('active');
+		expect(jobs(db)).toMatchObject([{ kind: 'main', status: 'pending', attempt_count: 1 }]);
+
+		await dispatchDueJobs({ db, rest, now: () => now + MINUTE_MS });
+		expect((await getReminder(db, id))?.status).toBe('error');
+		expect(jobs(db)).toMatchObject([{ kind: 'main', status: 'failed' }]);
+	});
+
+	it('disables the reminder when giving up on a main notification after transient errors', async () => {
+		const { db, id } = await setup();
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('oops', { status: 502 }));
+		let now = jstToUtcMs('2026-11-25', 9 * 60);
+		for (let i = 0; i < 5; i++) {
+			await dispatchDueJobs({ db, rest, now: () => now });
+			now += MINUTE_MS;
+		}
+
+		const reminder = await getReminder(db, id);
+		expect(reminder?.status).toBe('error');
+		expect(reminder?.last_error).toContain('status=502');
+		expect(jobs(db)).toMatchObject([{ kind: 'main', status: 'failed', attempt_count: 5 }]);
+	});
+
+	it('does not send follow-ups for a reminder in error state', async () => {
+		const { db, id } = await setup();
+		const now = jstToUtcMs('2026-11-25', 9 * 60);
+		db.raw.exec(
+			`INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state, last_message_id) VALUES (${id}, ${now}, 'open', 'msg-x')`,
+		);
+		db.raw.exec(`UPDATE reminders SET status = 'error' WHERE id = ${id}`);
 		db.raw.exec("UPDATE reminder_jobs SET status = 'cancelled' WHERE kind = 'main'");
 		await insertJob(db, { reminderId: id, occurrenceId: 1, kind: 'nag', runAt: now, scheduledAt: now }, now);
 		const fetchMock = mockDiscord();
