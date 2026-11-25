@@ -42,7 +42,10 @@ export const NOTIFY_SETTINGS_MODAL_ID = 'remind_notify_modal';
 /** [期間・祝日] ボタン・モーダル (`{reminderId}`) */
 export const PERIOD_SETTINGS_BUTTON_ID = 'remind_period_settings';
 export const PERIOD_SETTINGS_MODAL_ID = 'remind_period_modal';
-/** 管理画面: 対象の選択メニュー (値なし) と操作ボタン (`{reminderId}`) */
+/**
+ * 管理画面: 対象の選択メニュー (値なし) と操作ボタン (`{reminderId}`)。
+ * [一時停止] / [再開] ボタンは `{reminderId}:pause` / `{reminderId}:resume` (状態が変わった後の古いボタンで逆の操作をしないため)
+ */
 export const MANAGE_SELECT_ID = 'remind_manage_select';
 export const MANAGE_EDIT_BUTTON_ID = 'remind_manage_edit';
 export const MANAGE_TOGGLE_BUTTON_ID = 'remind_manage_toggle';
