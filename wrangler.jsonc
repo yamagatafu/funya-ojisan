@@ -12,7 +12,19 @@
 			"id": "098cee9f95ca4145833bef86c49e4f97"
 		}
 	],
-	// Preview URL は Discord の Interactions Endpoint URL として登録しない前提で同一 ID を指定
+	"d1_databases": [
+		{
+			"binding": "REMINDER_DB",
+			"database_name": "funya-ojisan-reminder",
+			"database_id": "65282223-fe9f-41ed-b1c8-7f7994a996d2",
+			"migrations_dir": "migrations"
+		}
+	],
+	// リマインダの送信ジョブを毎分処理する
+	"triggers": {
+		"crons": ["* * * * *"]
+	},
+	// Preview URL は Discord の Interactions Endpoint URL として登録しない前提で同一 ID (KV / D1) を指定
 	// DISCORD_GUILD_ID は scripts/register.ts 用だが、Workers Builds 側の環境変数定義との整合のため記載
 	"previews": {
 		"vars": {
@@ -23,6 +35,14 @@
 			{
 				"binding": "PANEL_KV",
 				"id": "098cee9f95ca4145833bef86c49e4f97"
+			}
+		],
+		"d1_databases": [
+			{
+				"binding": "REMINDER_DB",
+				"database_name": "funya-ojisan-reminder",
+				"database_id": "65282223-fe9f-41ed-b1c8-7f7994a996d2",
+				"migrations_dir": "migrations"
 			}
 		]
 	}
