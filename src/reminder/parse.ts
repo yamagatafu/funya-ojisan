@@ -78,7 +78,10 @@ export function parseDate(input: string, nowMs: number): string | null {
 	return isValidCivilDate(civil) ? formatDate(civil) : null;
 }
 
-const WEEKDAY_CHARS = ['日', '月', '火', '水', '木', '金', '土'] as const;
+/** 曜日の文字 → 曜日番号 (0=日 ... 6=土) */
+const WEEKDAY_INDEX = new Map<string, number>(
+	['日', '月', '火', '水', '木', '金', '土'].map((char, index) => [char, index]),
+);
 
 /** `月水金` / `月,水,金` / `月曜 水曜日` を曜日マスク (bit0=日 ... bit6=土) に変換する */
 export function parseWeekdays(input: string): number | null {
@@ -88,8 +91,8 @@ export function parseWeekdays(input: string): number | null {
 		if (/[\s,、・/]/.test(char)) {
 			continue;
 		}
-		const index = WEEKDAY_CHARS.indexOf(char as (typeof WEEKDAY_CHARS)[number]);
-		if (index < 0) {
+		const index = WEEKDAY_INDEX.get(char);
+		if (index === undefined) {
 			return null;
 		}
 		mask |= 1 << index;
