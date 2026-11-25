@@ -175,13 +175,8 @@ export function parseNotifySettingsValues(
 	if (!nagMax.ok) {
 		return nagMax;
 	}
+	// 間隔が空欄なら再通知を解除する (最大回数の欄に値が残っていても無視する)
 	const interval = nagInterval.value ?? 0;
-	if (interval === 0 && nagMax.value !== undefined) {
-		return {
-			ok: false,
-			message: `「${RANGES.nagMax.label}」は「${RANGES.nagInterval.label}」と一緒に入力してください。`,
-		};
-	}
 
 	const options: DetailEditOptions = {
 		pre_notify: preNotify.value ?? 0,

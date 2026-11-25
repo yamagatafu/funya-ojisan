@@ -320,14 +320,20 @@ describe('[通知設定]', () => {
 		});
 	});
 
-	it('rejects a nag count without an interval and a too short interval', async () => {
+	it('clears nagging when only the interval is blank, even if a max count remains', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db, { nag_interval_minutes: 30, nag_max_count: 5 });
+
+		const body = await send(db, modalInteraction(`remind_notify_modal;${reminder.id}`, notifyValues({ max: '5' })));
+
+		expect(body.data.content).toContain('を更新しました');
+		expect(await getReminder(db, reminder.id)).toMatchObject({ nag_interval_minutes: null });
+	});
+
+	it('rejects a too short interval', async () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
 
-		expectEphemeral(
-			await send(db, modalInteraction(`remind_notify_modal;${reminder.id}`, notifyValues({ max: '3' }))),
-			'「再通知の最大回数」は「完了まで再通知する間隔（分）」と一緒に入力してください。',
-		);
 		expectEphemeral(
 			await send(db, modalInteraction(`remind_notify_modal;${reminder.id}`, notifyValues({ interval: '3' }))),
 			/5 分以上/,
