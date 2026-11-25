@@ -1,4 +1,13 @@
-import { addDays, daysInMonth, jstToUtcMs, parseDateString, toEpochDay, utcMsToJst, weekdayOf } from './date.ts';
+import {
+	addDays,
+	daysInMonth,
+	jstToUtcMs,
+	MAX_SUPPORTED_YEAR,
+	parseDateString,
+	toEpochDay,
+	utcMsToJst,
+	weekdayOf,
+} from './date.ts';
 import { isJapaneseHoliday, nextBusinessDay } from './holidays.ts';
 
 export const SCHEDULE_TYPES = [
@@ -116,7 +125,11 @@ export function computeNextOccurrence(schedule: Schedule, afterMs: number): Occu
 		if (schedule.onceAt === null || schedule.onceAt <= afterMs) {
 			return null;
 		}
-		return { runAt: schedule.onceAt, originalDate: utcMsToJst(schedule.onceAt).date };
+		const originalDate = utcMsToJst(schedule.onceAt).date;
+		if (schedule.endDate && originalDate > schedule.endDate) {
+			return null;
+		}
+		return { runAt: schedule.onceAt, originalDate };
 	}
 
 	const afterDate = utcMsToJst(afterMs).date;
@@ -134,6 +147,10 @@ export function computeNextOccurrence(schedule: Schedule, afterMs: number): Occu
 			break;
 		}
 		if (schedule.endDate && date > schedule.endDate) {
+			break;
+		}
+		// 祝日の計算式が有効な範囲を超えると祝日を判定できないため、祝日を考慮する予定はそこで終える
+		if (schedule.holidayPolicy !== 'notify' && Number(date.slice(0, 4)) > MAX_SUPPORTED_YEAR) {
 			break;
 		}
 		if (!matchesPattern(schedule, date)) {

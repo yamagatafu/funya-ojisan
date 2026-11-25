@@ -36,6 +36,10 @@ describe('parseDate', () => {
 	it('rejects non-existent dates', () => {
 		expect(parseDate('2026-02-29', NOW)).toBeNull();
 		expect(parseDate('13/1', NOW)).toBeNull();
+		// 祝日の計算式が有効な範囲 (2099 年) を超える年は受け付けない
+		expect(parseDate('2099-12-31', NOW)).toBe('2099-12-31');
+		expect(parseDate('2100-01-01', NOW)).toBeNull();
+		expect(parseDate('9999-01-01', NOW)).toBeNull();
 	});
 });
 

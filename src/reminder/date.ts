@@ -7,6 +7,9 @@ export const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 export const MINUTE_MS = 60 * 1000;
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** 入力として受け付ける最後の年 (祝日の計算式が有効な範囲。holidays.ts を参照) */
+export const MAX_SUPPORTED_YEAR = 2099;
+
 export interface CivilDate {
 	year: number;
 	month: number; // 1-12
@@ -36,7 +39,7 @@ export function isValidCivilDate(date: CivilDate): boolean {
 		Number.isInteger(date.month) &&
 		Number.isInteger(date.day) &&
 		date.year >= 1970 &&
-		date.year <= 9999 &&
+		date.year <= MAX_SUPPORTED_YEAR &&
 		date.month >= 1 &&
 		date.month <= 12 &&
 		date.day >= 1 &&

@@ -225,6 +225,19 @@ describe('computeNextOccurrence', () => {
 		expect(next(noCount, at('2026-11-25'))).toBeNull();
 	});
 
+	it('respects the end date for once', () => {
+		const s = schedule({ type: 'once', onceAt: at('2026-12-01', '09:00'), endDate: '2026-11-30' });
+		expect(next(s, at('2026-11-25'))).toBeNull();
+	});
+
+	it('stops holiday-aware schedules after the last supported year', () => {
+		const skip = schedule({ type: 'monthly_day', dayOfMonth: 1, holidayPolicy: 'skip' });
+		expect(sequence(skip, at('2099-10-15'), 5)).toEqual(['2099-11-01 09:00', '2099-12-01 09:00']);
+		// 祝日を考慮しない予定は続ける
+		const notify = schedule({ type: 'monthly_day', dayOfMonth: 1 });
+		expect(next(notify, at('2099-12-15'))).toBe('2100-01-01 09:00');
+	});
+
 	describe('holidayPolicy', () => {
 		it('notify keeps holidays', () => {
 			const s = schedule({ type: 'weekdays' });
