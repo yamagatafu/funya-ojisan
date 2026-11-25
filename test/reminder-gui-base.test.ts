@@ -151,6 +151,13 @@ describe('new repeat select', () => {
 		expect(body.data.components?.at(-1)?.component?.default_values).toEqual([{ id: CHANNEL_ID, type: 'channel' }]);
 	});
 
+	it('does not default to a channel that cannot be a target (voice channel chat)', async () => {
+		const interaction = selectInteraction('remind_new_repeat', 'daily');
+		const body = await send(createTestDb(), { ...interaction, channel: { id: CHANNEL_ID, type: 2 } });
+		expect(body.type).toBe(9);
+		expect(body.data.components?.at(-1)?.component?.default_values).toBeUndefined();
+	});
+
 	it('rejects an unknown repeat type', async () => {
 		const body = await send(createTestDb(), selectInteraction('remind_new_repeat', 'hourly'));
 		expectEphemeral(body, /選択メニューは無効/);
@@ -250,7 +257,7 @@ describe('base modal submit (new)', () => {
 		const db = createTestDb();
 		const fields = { content: '会議', time: '09:00', channel: [OTHER_CHANNEL_ID] };
 		const message =
-			'通知先の権限を確認できませんでした。通知先のチャンネルで実行するか、/remind add の channel オプションを使ってください。';
+			'通知先の権限を確認できませんでした。通知先のチャンネルで実行するか、/remind add・/remind edit の channel オプションを使ってください。';
 
 		expectEphemeral(await send(db, modalInteraction('new:daily', fields)), message);
 		expectEphemeral(

@@ -85,7 +85,11 @@ export function formatBaseModalState(state: BaseModalState): string {
 }
 
 export function parseBaseModalState(value: string | undefined): BaseModalState | null {
-	const [mode, repeatValue, idValue] = (value ?? '').split(':');
+	const parts = (value ?? '').split(':');
+	if (parts.length > 3) {
+		return null;
+	}
+	const [mode, repeatValue, idValue] = parts;
 	const repeat = parseScheduleType(repeatValue);
 	if (!repeat) {
 		return null;
@@ -99,9 +103,14 @@ export function parseBaseModalState(value: string | undefined): BaseModalState |
 
 // ---- 「繰り返し」の選択メニュー ----
 
+/**
+ * 「繰り返し」の選択メニュー。
+ * 現在の種類は default ではなくプレースホルダーに表示する。default にした選択肢は選び直しても
+ * イベントが発生しないため、「繰り返しはそのままで内容だけ編集する」操作ができなくなる
+ */
 export function buildRepeatSelect(
 	customId: string,
-	selected?: ScheduleType,
+	current?: ScheduleType,
 ): APIActionRowComponent<APIStringSelectComponent> {
 	return {
 		type: ComponentType.ActionRow,
@@ -109,12 +118,10 @@ export function buildRepeatSelect(
 			{
 				type: ComponentType.StringSelect,
 				custom_id: customId,
-				placeholder: '繰り返しを選んでください',
-				options: SCHEDULE_TYPES.map((type) => ({
-					label: REPEAT_LABELS[type],
-					value: type,
-					default: type === selected,
-				})),
+				placeholder: current
+					? `繰り返しを選んでください（現在: ${REPEAT_LABELS[current]}）`
+					: '繰り返しを選んでください',
+				options: SCHEDULE_TYPES.map((type) => ({ label: REPEAT_LABELS[type], value: type })),
 			},
 		],
 	};

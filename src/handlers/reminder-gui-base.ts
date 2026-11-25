@@ -25,6 +25,7 @@ import {
 	reminderToBaseDefaults,
 } from '../reminder/gui.ts';
 import { buildScheduleForAdd } from '../reminder/options.ts';
+import { REMINDER_CHANNEL_TYPE_SET } from '../reminder/permissions.ts';
 import { LAST_WEEK, type ScheduleType } from '../reminder/schedule.ts';
 import type { ReminderDb } from '../types.ts';
 import {
@@ -45,7 +46,7 @@ const MESSAGES = {
 	invalidDay: '日は 1〜31 の整数で入力してください。',
 	invalidNth: '第何週かの指定が正しくありません。',
 	unknownChannelPermissions:
-		'通知先の権限を確認できませんでした。通知先のチャンネルで実行するか、/remind add の channel オプションを使ってください。',
+		'通知先の権限を確認できませんでした。通知先のチャンネルで実行するか、/remind add・/remind edit の channel オプションを使ってください。',
 	error: 'エラーが発生しました。時間をおいて再度お試しください。',
 } as const;
 
@@ -56,7 +57,7 @@ function notFound(id: number | null): string {
 interface InteractionLike {
 	guild_id?: string;
 	member?: unknown;
-	channel?: { id: string };
+	channel?: { id: string; type?: number };
 	channel_id?: string;
 }
 
@@ -74,6 +75,16 @@ function checkContext(db: ReminderDb | undefined, interaction: InteractionLike):
 
 function interactionChannelId(interaction: InteractionLike): string | undefined {
 	return interaction.channel?.id ?? interaction.channel_id;
+}
+
+/**
+ * 通知先の初期値にできる、実行したチャンネル。
+ * 通知先にできない種類 (ボイスチャンネルのチャットなど) を初期値にすると、
+ * チャンネル選択の channel_types と食い違ってモーダルの表示が拒否されるため、その場合は初期値なしにする
+ */
+function defaultTargetChannelId(interaction: InteractionLike): string | undefined {
+	const type = interaction.channel?.type;
+	return type !== undefined && REMINDER_CHANNEL_TYPE_SET.has(type) ? interactionChannelId(interaction) : undefined;
 }
 
 /** 選択メニューで選ばれた繰り返しの種類 */
@@ -104,7 +115,7 @@ export const reminderNewRepeatSelect = factory.component(selectComponent(NEW_REP
 	if (!repeat) {
 		return c.flags('EPHEMERAL').res(MESSAGES.invalidSelect);
 	}
-	return c.resModal(buildBaseModal({ mode: 'new', repeat }, { channelId: interactionChannelId(c.interaction) }));
+	return c.resModal(buildBaseModal({ mode: 'new', repeat }, { channelId: defaultTargetChannelId(c.interaction) }));
 });
 
 /** 管理画面の「繰り返し」選択 (custom_value はリマインダ ID) → 現在の値を初期値にした基本モーダル */

@@ -202,7 +202,6 @@ export interface Invocation {
 	opts: RemindOptions;
 }
 
-/** 即時に返す応答か、遅延応答 (REST を使う処理の後に返す) */
 /** ボタンや選択メニューを含む応答 */
 export interface ReplyMessage {
 	content: string;
@@ -786,11 +785,6 @@ export const remindCommand = factory.autocomplete(
 		if (!db) {
 			console.error('REMINDER_DB binding is not configured.');
 			return ephemeral.res({ content: 'リマインダの保存先が設定されていません。管理者に連絡してください。' });
-		}
-		const member = c.interaction.member;
-		const guildId = c.interaction.guild_id;
-		if (!member || !guildId) {
-			return ephemeral.res({ content: 'このコマンドはサーバー内でのみ使用できます。' });
 		}
 		const handler = SUBCOMMANDS[c.sub.command];
 		if (!handler) {

@@ -5,6 +5,7 @@ import {
 	BASE_FIELD,
 	buildBaseModal,
 	buildDetailButtons,
+	buildRepeatSelect,
 	formatBaseModalState,
 	parseBaseModalState,
 	parseBaseModalValues,
@@ -36,7 +37,16 @@ describe('base modal state', () => {
 	});
 
 	it('rejects malformed states', () => {
-		for (const value of ['', 'new', 'new:hourly', 'edit:once', 'edit:once:0', 'new:once:3', 'x:once']) {
+		for (const value of [
+			'',
+			'new',
+			'new:hourly',
+			'edit:once',
+			'edit:once:0',
+			'new:once:3',
+			'x:once',
+			'edit:once:12:extra',
+		]) {
 			expect(parseBaseModalState(value)).toBeNull();
 		}
 	});
@@ -131,6 +141,15 @@ describe('parseBaseModalValues', () => {
 			channel: undefined,
 			schedule: { repeat: 'once', time: '09:00', date: undefined },
 		});
+	});
+});
+
+describe('buildRepeatSelect', () => {
+	it('shows the current type in the placeholder instead of preselecting it', () => {
+		const select = buildRepeatSelect('remind_edit_repeat;3', 'weekly').components[0]!;
+		expect(select.placeholder).toBe('繰り返しを選んでください（現在: 毎週）');
+		// default にした選択肢は選び直してもイベントが発生しないため、default は付けない
+		expect(select.options.every((option) => option.default === undefined)).toBe(true);
 	});
 });
 
