@@ -440,7 +440,7 @@ export async function claimJob(db: ReminderDb, id: number, now: number): Promise
 
 export type JobUpdate = Partial<Pick<JobRow, 'status' | 'run_at' | 'attempt_count' | 'occurrence_id'>>;
 
-/** ジョブを更新する SQL 文。ロックは解除する。condition を指定すると、その条件を満たす場合だけ更新する */
+/** ジョブを更新する SQL 文。ロックは解除する。condition を指定すると、その条件を満たす場合だけ更新する (更新したかは RETURNING id で分かる) */
 export function updateJobStatement(
 	db: ReminderDb,
 	id: number,
@@ -452,7 +452,7 @@ export function updateJobStatement(
 	const where = condition ? `id = ? AND ${condition.sql}` : 'id = ?';
 	return db
 		.prepare(
-			`UPDATE reminder_jobs SET ${[...entries.map(([column]) => `${column} = ?`), 'locked_at = NULL', 'updated_at = ?'].join(', ')} WHERE ${where}`,
+			`UPDATE reminder_jobs SET ${[...entries.map(([column]) => `${column} = ?`), 'locked_at = NULL', 'updated_at = ?'].join(', ')} WHERE ${where} RETURNING id`,
 		)
 		.bind(...entries.map(([, value]) => value), now, id, ...(condition?.values ?? []));
 }

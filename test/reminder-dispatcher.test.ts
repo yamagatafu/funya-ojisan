@@ -569,6 +569,41 @@ describe('dispatchDueJobs', () => {
 		expect(occurrences(db).map((occurrence) => occurrence.state)).toEqual(['open']);
 	});
 
+	it('does not remove buttons when the lock was lost before the post-send batch', async () => {
+		const { db, id } = await setup({ nag_interval_minutes: 10, nag_max_count: 2 });
+		const start = jstToUtcMs('2026-11-25', 9 * 60);
+		// 前の回の通知 (ボタン付き) が開いている状態にする
+		db.raw.exec(
+			`INSERT INTO reminder_occurrences (reminder_id, scheduled_at, state, last_message_id, channel_id) VALUES (${id}, ${start - 24 * 60 * MINUTE_MS}, 'open', 'msg-prev', '${CHANNEL_ID}')`,
+		);
+		const loseLock = (jobId: number, at: number) =>
+			db.raw.exec(`UPDATE reminder_jobs SET locked_at = ${at} WHERE id = ${jobId}`);
+		let lockedJobId = 1;
+		let messageSeq = 0;
+		const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+			if (init?.method === 'POST') {
+				// 送信中にロックが切れ、別の実行がジョブを再取得した状況を再現する
+				loseLock(lockedJobId, start + 60 * MINUTE_MS);
+				messageSeq++;
+				return jsonResponse({ id: `msg-${messageSeq}` });
+			}
+			return jsonResponse({});
+		});
+
+		// 本通知: 前の回のボタンを外さない
+		await dispatchDueJobs({ db, rest, now: () => start });
+		expect(calls(fetchMock).filter((call) => call.method === 'PATCH')).toHaveLength(0);
+		expect(occurrences(db).map((occurrence) => occurrence.state)).toEqual(['open', 'open']);
+
+		// 再通知: 前のメッセージのボタンを外さない
+		db.raw.exec("UPDATE reminder_jobs SET status = 'cancelled'");
+		await insertJob(db, { reminderId: id, occurrenceId: 2, kind: 'nag', runAt: start, scheduledAt: start }, start);
+		lockedJobId = jobs(db).at(-1)!.id;
+		await dispatchDueJobs({ db, rest, now: () => start + MINUTE_MS });
+		expect(calls(fetchMock).filter((call) => call.method === 'POST')).toHaveLength(2);
+		expect(calls(fetchMock).filter((call) => call.method === 'PATCH')).toHaveLength(0);
+	});
+
 	it('does not write results after the lock was taken over by another run', async () => {
 		const { db } = await setup({ nag_interval_minutes: 10, nag_max_count: 1 });
 		const now = jstToUtcMs('2026-11-25', 9 * 60);

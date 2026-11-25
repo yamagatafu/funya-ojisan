@@ -249,6 +249,11 @@ async function processPreJob(ctx: DispatchContext, job: ClaimedJob, reminder: Re
 	}
 }
 
+/** batch の最後の文 (ジョブの完了の更新。RETURNING id) が行を更新したか = 今もロックを持っていたか */
+function updatedLastStatement(results: { results: unknown[] }[]): boolean {
+	return (results.at(-1)?.results.length ?? 0) > 0;
+}
+
 /** 送信済みの通知メッセージ (ボタンを外す対象) */
 interface SentMessage {
 	channelId: string;
@@ -377,7 +382,7 @@ async function processMainJob(ctx: DispatchContext, job: ClaimedJob, reminder: R
 			extraUpdate: remainingCount === null ? undefined : { remaining_count: remainingCount },
 		},
 	);
-	await ctx.db.batch(
+	const results = await ctx.db.batch(
 		compact([
 			...supersede.statements,
 			nagStatement(ctx, reminder, occurrence, occurrence.nag_count, owned(job)),
@@ -385,6 +390,10 @@ async function processMainJob(ctx: DispatchContext, job: ClaimedJob, reminder: R
 			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now, owned(job)),
 		]),
 	);
+	// ロックを失っていた場合は batch の更新が反映されないため、前の回のボタンも外さない
+	if (!updatedLastStatement(results)) {
+		return;
+	}
 
 	for (const message of supersede.messages) {
 		await removeButtons(ctx.rest, message.channelId, message.messageId);
@@ -433,7 +442,7 @@ async function processFollowUpJob(ctx: DispatchContext, job: ClaimedJob, reminde
 	}
 
 	const now = ctx.now();
-	await ctx.db.batch(
+	const results = await ctx.db.batch(
 		compact([
 			updateOccurrenceStatement(
 				ctx.db,
@@ -445,10 +454,11 @@ async function processFollowUpJob(ctx: DispatchContext, job: ClaimedJob, reminde
 			updateJobStatement(ctx.db, job.id, { status: 'sent' }, now, owned(job)),
 		]),
 	);
-
-	if (occurrence.last_message_id !== messageId) {
-		await removeButtons(ctx.rest, channelId, occurrence.last_message_id);
+	// ロックを失っていた場合は回が更新されていないため、前のメッセージのボタンも外さない
+	if (!updatedLastStatement(results) || occurrence.last_message_id === messageId) {
+		return;
 	}
+	await removeButtons(ctx.rest, channelId, occurrence.last_message_id);
 }
 
 async function processJob(ctx: DispatchContext, job: ClaimedJob): Promise<void> {
