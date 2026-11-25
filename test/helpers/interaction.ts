@@ -9,8 +9,10 @@ export const CHANNEL_ID = '200000000000000000';
 export const USER_ID = '300000000000000000';
 /** VIEW_CHANNEL | SEND_MESSAGES | SEND_MESSAGES_IN_THREADS */
 export const MEMBER_PERMISSIONS = String((1n << 10n) | (1n << 11n) | (1n << 38n));
-/** MEMBER_PERMISSIONS | MANAGE_MESSAGES */
+/** MEMBER_PERMISSIONS | MANAGE_MESSAGES (チャンネル単位の権限。ボタン操作のみ許可される) */
 export const MODERATOR_PERMISSIONS = String(BigInt(MEMBER_PERMISSIONS) | (1n << 13n));
+/** MEMBER_PERMISSIONS | MANAGE_GUILD (サーバー全体のリマインダを管理できる) */
+export const SERVER_MANAGER_PERMISSIONS = String(BigInt(MEMBER_PERMISSIONS) | (1n << 5n));
 
 export function createEnv(db: ReminderDb): AppBindings {
 	const kv: PanelKvStore = {

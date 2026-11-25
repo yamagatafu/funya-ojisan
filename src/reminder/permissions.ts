@@ -24,6 +24,7 @@ export const REMINDER_CHANNEL_TYPES = [
 	ChannelType.PrivateThread,
 	ChannelType.AnnouncementThread,
 ] as const;
+const REMINDER_CHANNEL_TYPE_SET = new Set<number>(REMINDER_CHANNEL_TYPES);
 
 export function hasPermission(permissions: string | undefined | null, flag: bigint): boolean {
 	if (!permissions) {
@@ -90,10 +91,7 @@ export function resolveChannelTarget(params: {
 
 /** 通知先チャンネルに実行者 (と分かる範囲で Bot) が投稿できるか */
 export function checkChannelTarget(target: ChannelTarget): CheckResult {
-	if (
-		target.channelType !== undefined &&
-		!(REMINDER_CHANNEL_TYPES as readonly number[]).includes(target.channelType)
-	) {
+	if (target.channelType !== undefined && !REMINDER_CHANNEL_TYPE_SET.has(target.channelType)) {
 		return {
 			ok: false,
 			message: 'このチャンネルにはリマインダを設定できません。テキストチャンネルかスレッドを指定してください。',
@@ -147,21 +145,30 @@ export interface ActingMember {
 	permissions: string | undefined;
 }
 
-export function isModerator(member: ActingMember): boolean {
-	return hasPermission(member.permissions, PermissionFlagsBits.ManageMessages);
+/**
+ * サーバー全体のリマインダを管理できるか (MANAGE_GUILD、ADMINISTRATOR を含む)。
+ * member.permissions は実行したチャンネルの権限の上書きを適用した値のため、チャンネル単位で付与できる
+ * MANAGE_MESSAGES ではなく、上書きの影響を受けないサーバー単位の権限で判定する
+ */
+export function isServerManager(member: ActingMember): boolean {
+	return hasPermission(member.permissions, PermissionFlagsBits.ManageGuild);
 }
 
-/** 編集・削除・一時停止・再開できるか (登録者・MANAGE_MESSAGES 保持者) */
+/** 編集・削除・一時停止・再開できるか (登録者・サーバーの管理権限の保持者) */
 export function canManageReminder(reminder: Pick<ReminderRow, 'owner_id'>, member: ActingMember): boolean {
-	return reminder.owner_id === member.userId || isModerator(member);
+	return reminder.owner_id === member.userId || isServerManager(member);
 }
 
-/** 完了・スヌーズできるか (登録者・メンション対象・対象ロールのメンバー・MANAGE_MESSAGES 保持者) */
+/**
+ * 完了・スヌーズできるか (登録者・メンション対象・対象ロールのメンバー・サーバーの管理権限の保持者、
+ * または通知のあるチャンネルで MANAGE_MESSAGES を持つメンバー)。
+ * member.permissions はボタンを押したチャンネル (= 通知先) の権限のため、MANAGE_MESSAGES はそのチャンネルに限った判定になる
+ */
 export function canOperateOccurrence(
 	reminder: Pick<ReminderRow, 'owner_id' | 'mention_type' | 'mention_target_id'>,
 	member: ActingMember,
 ): boolean {
-	if (canManageReminder(reminder, member)) {
+	if (canManageReminder(reminder, member) || hasPermission(member.permissions, PermissionFlagsBits.ManageMessages)) {
 		return true;
 	}
 	if (reminder.mention_type === 'user') {

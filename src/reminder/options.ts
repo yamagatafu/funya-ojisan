@@ -129,11 +129,11 @@ function resolveDateFromToday(partial: PartialDate, nowMs: number): string | nul
 }
 
 function parseRepeat(value: string): ScheduleType | null {
-	return (SCHEDULE_TYPES as readonly string[]).includes(value) ? (value as ScheduleType) : null;
+	return SCHEDULE_TYPES.find((type) => type === value) ?? null;
 }
 
 function parseHolidays(value: string): HolidayPolicy | null {
-	return (HOLIDAY_POLICIES as readonly string[]).includes(value) ? (value as HolidayPolicy) : null;
+	return HOLIDAY_POLICIES.find((policy) => policy === value) ?? null;
 }
 
 function countBits(mask: number): number {

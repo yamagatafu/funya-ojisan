@@ -27,6 +27,7 @@ import {
 	GUILD_ID,
 	MEMBER_PERMISSIONS,
 	MODERATOR_PERMISSIONS,
+	SERVER_MANAGER_PERMISSIONS,
 	USER_ID,
 } from './helpers/interaction.ts';
 
@@ -615,6 +616,19 @@ describe('/remind edit', () => {
 		});
 	});
 
+	it('does not treat a channel-level MANAGE_MESSAGES as server-wide management', async () => {
+		const db = createTestDb();
+		const reminder = await seed(db);
+		const params = { userId: OTHER_USER_ID, permissions: MODERATOR_PERMISSIONS };
+
+		expect(await run(db, 'edit', [opt('id', reminder.id), opt('time', '10:00')], params)).toContain(
+			'見つかりません',
+		);
+		expect(await run(db, 'delete', [opt('id', reminder.id)], params)).toContain('見つかりません');
+		expect(await run(db, 'list', [opt('all', true)], params)).toContain('サーバーの管理権限');
+		expect(reminders(db)).toHaveLength(1);
+	});
+
 	it('allows only the owner or a moderator in the same guild', async () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
@@ -637,7 +651,7 @@ describe('/remind edit', () => {
 		expect(
 			await run(db, 'edit', [opt('id', reminder.id), opt('time', '10:00')], {
 				userId: OTHER_USER_ID,
-				permissions: MODERATOR_PERMISSIONS,
+				permissions: SERVER_MANAGER_PERMISSIONS,
 			}),
 		).toContain('✏️');
 		// 管理者が編集しても、所有者は変わらない
@@ -687,8 +701,8 @@ describe('/remind list', () => {
 		await seed(db);
 		await seed(db, { owner_id: OTHER_USER_ID, content: '他の人' });
 
-		expect(await run(db, 'list', [opt('all', true)])).toContain('メッセージの管理権限');
-		const content = await run(db, 'list', [opt('all', true)], { permissions: MODERATOR_PERMISSIONS });
+		expect(await run(db, 'list', [opt('all', true)])).toContain('サーバーの管理権限');
+		const content = await run(db, 'list', [opt('all', true)], { permissions: SERVER_MANAGER_PERMISSIONS });
 		expect(content).toContain('このサーバーのリマインダ（2 件）');
 		expect(content).toContain(`<@${OTHER_USER_ID}>`);
 	});
@@ -834,7 +848,7 @@ describe('/remind id autocomplete', () => {
 		for (let i = 0; i < 12; i++) {
 			await seed(db, { owner_id: i % 2 === 0 ? USER_ID : OTHER_USER_ID, content: `用事${i}` });
 		}
-		const params = { permissions: MODERATOR_PERMISSIONS };
+		const params = { permissions: SERVER_MANAGER_PERMISSIONS };
 		expect(await choices(db, 'delete', '', params)).toHaveLength(12);
 		expect((await choices(db, 'pause', '1', params)).map((choice) => choice.value)).toEqual([1, 2, 10, 11, 12]);
 		expect((await choices(db, 'resume', '#12', params)).map((choice) => choice.value)).toEqual([12]);
@@ -846,7 +860,7 @@ describe('/remind id autocomplete', () => {
 		for (let i = 0; i < 30; i++) {
 			await seed(db, { owner_id: `3${String(i).padStart(17, '0')}`, content: 'い'.repeat(200) });
 		}
-		const result = await choices(db, 'edit', '', { permissions: MODERATOR_PERMISSIONS });
+		const result = await choices(db, 'edit', '', { permissions: SERVER_MANAGER_PERMISSIONS });
 		expect(result).toHaveLength(25);
 		expect(result.every((choice) => Array.from(choice.name).length <= 100)).toBe(true);
 	});

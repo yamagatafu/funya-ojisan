@@ -39,7 +39,7 @@ import {
 	checkCreationLimits,
 	checkMention,
 	hasPermission,
-	isModerator,
+	isServerManager,
 	MAX_CONTENT_LENGTH,
 	MAX_REMINDERS_PER_GUILD,
 	MAX_REMINDERS_PER_USER,
@@ -47,6 +47,7 @@ import {
 	resolveChannelTarget,
 } from '../reminder/permissions.ts';
 import {
+	compact,
 	countLiveReminders,
 	deleteReminder,
 	getReminder,
@@ -65,12 +66,6 @@ import {
 	reminderToSchedule,
 	updateReminderAndSchedule,
 } from '../reminder/service.ts';
-import type { DbStatement } from '../types.ts';
-
-function compact(statements: (DbStatement | null)[]): DbStatement[] {
-	return statements.filter((statement): statement is DbStatement => statement !== null);
-}
-
 import type { ReminderDb } from '../types.ts';
 
 /** 一覧に表示する最大件数 */
@@ -170,7 +165,7 @@ export const remindCommandDefinition = makeSlashCommand('remind', 'リマイン�
 			...scheduleOptions('edit'),
 		]),
 		makeSubCommand('list', 'リマインダの一覧を表示します').options([
-			makeBooleanOption('all', 'サーバー全体のリマインダを表示（メッセージの管理権限が必要）'),
+			makeBooleanOption('all', 'サーバー全体のリマインダを表示（サーバーの管理権限が必要）'),
 		]),
 		makeSubCommand('delete', 'リマインダを削除します').options([idOption()]),
 		makeSubCommand('pause', 'リマインダを一時停止します').options([idOption()]),
@@ -205,6 +200,44 @@ interface Invocation {
 
 /** 即時に返す応答か、遅延応答 (REST を使う処理の後に返す) */
 type Reply = string | { deferred: (rest: Rest) => Promise<string> };
+
+/** コマンドのオプション値を型を確認しながら取り出す (想定外の型の値は未指定として扱う) */
+function decodeRemindOptions(vars: Readonly<Record<string, unknown>>): RemindOptions {
+	const string = (name: string): string | undefined => {
+		const value = vars[name];
+		return typeof value === 'string' ? value : undefined;
+	};
+	const integer = (name: string): number | undefined => {
+		const value = vars[name];
+		return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined;
+	};
+	const boolean = (name: string): boolean | undefined => {
+		const value = vars[name];
+		return typeof value === 'boolean' ? value : undefined;
+	};
+	return {
+		id: integer('id'),
+		content: string('content'),
+		channel: string('channel'),
+		mention: string('mention'),
+		minutes: integer('minutes'),
+		hours: integer('hours'),
+		days: integer('days'),
+		all: boolean('all'),
+		time: string('time'),
+		repeat: string('repeat'),
+		date: string('date'),
+		weekdays: string('weekdays'),
+		day: integer('day'),
+		nth: integer('nth'),
+		pre_notify: integer('pre_notify'),
+		nag_interval: integer('nag_interval'),
+		nag_max: integer('nag_max'),
+		holidays: string('holidays'),
+		until: string('until'),
+		count: integer('count'),
+	};
+}
 
 function actorOf(member: APIInteractionGuildMember): ActingMember {
 	return { userId: member.user.id, roles: member.roles, permissions: member.permissions };
@@ -503,8 +536,8 @@ function listLine(reminder: ReminderRow, showOwner: boolean): string {
 
 async function handleList(inv: Invocation): Promise<Reply> {
 	const all = inv.opts.all === true;
-	if (all && !isModerator(inv.actor)) {
-		return 'all を指定できるのはメッセージの管理権限を持つメンバーのみです。';
+	if (all && !isServerManager(inv.actor)) {
+		return 'all を指定できるのはサーバーの管理権限を持つメンバーのみです。';
 	}
 	const ownerId = all ? undefined : inv.actor.userId;
 	const [reminders, total] = await Promise.all([
@@ -665,7 +698,7 @@ export const remindCommand = factory.autocomplete(
 			.trim();
 		const reminders = await listReminders(db, {
 			guildId,
-			ownerId: isModerator(actor) ? undefined : actor.userId,
+			ownerId: isServerManager(actor) ? undefined : actor.userId,
 			limit: MAX_REMINDERS_PER_GUILD,
 		});
 		return c.resAutocomplete(
@@ -702,7 +735,7 @@ export const remindCommand = factory.autocomplete(
 			channelType: c.interaction.channel?.type,
 			appPermissions: c.interaction.app_permissions,
 			resolved: 'resolved' in data ? data.resolved : undefined,
-			opts: c.var as RemindOptions,
+			opts: decodeRemindOptions(c.var),
 		};
 
 		let reply: Reply;
