@@ -66,7 +66,7 @@ function reminderInput(overrides: Partial<ReminderInput> = {}): ReminderInput {
 async function setup(overrides: Partial<ReminderInput> = {}) {
 	const db = createTestDb();
 	const reminderId = await insertReminder(db, reminderInput(overrides), SCHEDULED_AT - 60 * MINUTE_MS);
-	const occurrenceId = await insertOccurrence(db, reminderId, SCHEDULED_AT);
+	const occurrenceId = await insertOccurrence(db, reminderId, SCHEDULED_AT, CHANNEL_ID);
 	const nagJobId = await insertJob(
 		db,
 		{ reminderId, occurrenceId, kind: 'nag', runAt: SCHEDULED_AT + 10 * MINUTE_MS, scheduledAt: SCHEDULED_AT },
@@ -286,6 +286,58 @@ describe('reminder action buttons', () => {
 			const body = await send(db, buttonInteraction('remind_done;abc', 1));
 
 			expectEphemeral(body, 'このボタンは無効です。');
+		});
+	});
+
+	describe('一体性と同時操作', () => {
+		/** batch の最後に失敗する文を足し、途中まで実行した文ごとロールバックさせる */
+		function failBatchOnce(db: ReturnType<typeof createTestDb>) {
+			const batch = db.batch.bind(db);
+			return vi
+				.spyOn(db, 'batch')
+				.mockImplementationOnce((statements) =>
+					batch([...statements, db.prepare('INSERT INTO no_such_table VALUES (1)')]),
+				);
+		}
+
+		it('rolls back both cancellation and completion when the batch fails', async () => {
+			const { db, occurrenceId, nagJobId } = await setup();
+			const spy = failBatchOnce(db);
+
+			await send(db, buttonInteraction(`remind_done;${occurrenceId}`, occurrenceId)).catch(() => undefined);
+
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect((await getOccurrence(db, occurrenceId))?.state).toBe('open');
+			expect(jobs(db).find((job) => job.id === nagJobId)?.status).toBe('pending');
+
+			const body = await send(db, buttonInteraction(`remind_done;${occurrenceId}`, occurrenceId));
+			expect(body.data.content).toContain('が完了しました');
+			expect(jobs(db).find((job) => job.id === nagJobId)?.status).toBe('cancelled');
+		});
+
+		it('keeps the existing nag when a snooze batch fails', async () => {
+			const { db, occurrenceId, nagJobId } = await setup();
+			failBatchOnce(db);
+
+			await send(db, buttonInteraction(`remind_snooze;${occurrenceId}:15`, occurrenceId)).catch(() => undefined);
+
+			expect(jobs(db).find((job) => job.id === nagJobId)?.status).toBe('pending');
+			expect(jobs(db).filter((job) => job.kind === 'snooze')).toHaveLength(0);
+		});
+
+		it('does not leave a snooze on an occurrence completed concurrently', async () => {
+			const { db, occurrenceId } = await setup();
+			const batch = db.batch.bind(db);
+			vi.spyOn(db, 'batch').mockImplementationOnce(async (statements) => {
+				// 確認後、スヌーズの登録前に別のメンバーが完了させた状況を再現する
+				await closeOccurrence(db, occurrenceId, 'completed', { by: OTHER_ID, now: NOW });
+				return batch(statements);
+			});
+
+			const body = await send(db, buttonInteraction(`remind_snooze;${occurrenceId}:15`, occurrenceId));
+
+			expectEphemeral(body, 'この通知はすでに完了または終了しています。');
+			expect(jobs(db).filter((job) => job.kind === 'snooze')).toHaveLength(0);
 		});
 	});
 

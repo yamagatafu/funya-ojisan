@@ -5,11 +5,12 @@ import { formatJstTime, MINUTE_MS } from '../reminder/date.ts';
 import { DONE_BUTTON_ID, SNOOZE_BUTTON_ID, SNOOZE_CUSTOM_BUTTON_ID, withStatusLine } from '../reminder/message.ts';
 import { canOperateOccurrence } from '../reminder/permissions.ts';
 import {
-	cancelPendingJobs,
-	closeOccurrence,
+	cancelPendingJobsStatement,
+	closeOccurrenceStatement,
+	type ExtraCondition,
 	getOccurrence,
 	getReminder,
-	insertJob,
+	insertJobStatement,
 	type OccurrenceRow,
 	type ReminderRow,
 } from '../reminder/repository.ts';
@@ -93,31 +94,52 @@ async function loadTarget(
 	return { ok: true, occurrence, reminder, userId };
 }
 
-/** その回の未送信の再通知・スヌーズを取り消し、新しいスヌーズを登録する。再通知の時刻を返す */
+/** 回が open である間だけ満たされる条件 */
+function occurrenceOpenCondition(occurrenceId: number): ExtraCondition {
+	return {
+		sql: "EXISTS (SELECT 1 FROM reminder_occurrences WHERE id = ? AND state = 'open')",
+		values: [occurrenceId],
+	};
+}
+
+/**
+ * その回の未送信の再通知・スヌーズを取り消し、新しいスヌーズを登録する。
+ * 取り消しと登録は 1 つの batch で行い、登録は回が open の場合だけ行う
+ * (完了処理と同時に実行されても、完了済みの回にスヌーズが残らない)。
+ * 登録できた場合は再通知の時刻を、回が閉じていた場合は null を返す。
+ */
 async function snooze(
 	db: ReminderDb,
 	target: { occurrence: OccurrenceRow; reminder: ReminderRow },
 	minutes: number,
 	now: number,
-): Promise<number> {
+): Promise<number | null> {
 	const runAt = now + minutes * MINUTE_MS;
-	await cancelPendingJobs(
-		db,
-		{ reminderId: target.reminder.id, occurrenceId: target.occurrence.id, kinds: [...CANCELLED_KINDS_ON_ACTION] },
-		now,
-	);
-	await insertJob(
-		db,
-		{
-			reminderId: target.reminder.id,
-			occurrenceId: target.occurrence.id,
-			kind: 'snooze',
-			runAt,
-			scheduledAt: target.occurrence.scheduled_at,
-		},
-		now,
-	);
-	return runAt;
+	await db.batch([
+		cancelPendingJobsStatement(
+			db,
+			{
+				reminderId: target.reminder.id,
+				occurrenceId: target.occurrence.id,
+				kinds: [...CANCELLED_KINDS_ON_ACTION],
+			},
+			now,
+		),
+		insertJobStatement(
+			db,
+			{
+				reminderId: target.reminder.id,
+				occurrenceId: target.occurrence.id,
+				kind: 'snooze',
+				runAt,
+				scheduledAt: target.occurrence.scheduled_at,
+			},
+			now,
+			occurrenceOpenCondition(target.occurrence.id),
+		),
+	]);
+	const occurrence = await getOccurrence(db, target.occurrence.id);
+	return occurrence?.state === 'open' ? runAt : null;
 }
 
 function snoozedContent(interaction: InteractionLike, userId: string, runAt: number): string {
@@ -160,14 +182,27 @@ export const reminderDoneComponent = factory.component(makeButton(DONE_BUTTON_ID
 		return c.flags('EPHEMERAL').res(target.message);
 	}
 	const now = Date.now();
-	// 先に未送信の再通知・スヌーズを取り消してから完了にする。
-	// 取り消しで失敗した場合は回が open のまま残るため、再度押せば最後まで完了できる
-	await cancelPendingJobs(
-		db,
-		{ reminderId: target.reminder.id, occurrenceId: target.occurrence.id, kinds: [...CANCELLED_KINDS_ON_ACTION] },
-		now,
-	);
-	if (!(await closeOccurrence(db, target.occurrence.id, 'completed', { by: target.userId, now }))) {
+	// 未送信の再通知・スヌーズの取り消しと完了への更新は 1 つの batch で行う。
+	// 失敗した場合はどちらも反映されず、回は open のまま残るため、再度押せば完了できる
+	await db.batch([
+		cancelPendingJobsStatement(
+			db,
+			{
+				reminderId: target.reminder.id,
+				occurrenceId: target.occurrence.id,
+				kinds: [...CANCELLED_KINDS_ON_ACTION],
+			},
+			now,
+		),
+		closeOccurrenceStatement(db, target.occurrence.id, 'completed', { by: target.userId, now }),
+	]);
+	const completed = await getOccurrence(db, target.occurrence.id);
+	if (
+		completed?.state !== 'completed' ||
+		completed.completed_by !== target.userId ||
+		completed.completed_at !== now
+	) {
+		// 確認後に他の操作 (置き換え・別の完了) が先に閉じていた
 		return c.flags('EPHEMERAL').res(MESSAGES.closed);
 	}
 	return c.update().res({
@@ -191,6 +226,9 @@ export const reminderSnoozeComponent = factory.component(makeButton(SNOOZE_BUTTO
 		return c.flags('EPHEMERAL').res(target.ok ? MESSAGES.invalid : target.message);
 	}
 	const runAt = await snooze(db, target, minutes, Date.now());
+	if (runAt === null) {
+		return c.flags('EPHEMERAL').res(MESSAGES.closed);
+	}
 	// components を省略するとボタンはそのまま残る
 	return c.update().res({
 		content: snoozedContent(c.interaction, target.userId, runAt),
@@ -229,6 +267,9 @@ export const reminderSnoozeModal = factory.modal(
 			return c.flags('EPHEMERAL').res(target.message);
 		}
 		const runAt = await snooze(db, target, minutes, Date.now());
+		if (runAt === null) {
+			return c.flags('EPHEMERAL').res(MESSAGES.closed);
+		}
 		return c.update().res({
 			content: snoozedContent(c.interaction, target.userId, runAt),
 			allowed_mentions: { parse: [] },
