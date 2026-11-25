@@ -2,7 +2,13 @@ import { type APIModalInteractionResponseCallbackData, ComponentType, TextInputS
 import { makeActionRow, makeButton, makeModal, makeTextInput, textInputStyle } from 'discord-hono';
 import { factory } from '../factory.ts';
 import { formatJstTime, MINUTE_MS } from '../reminder/date.ts';
-import { DONE_BUTTON_ID, SNOOZE_BUTTON_ID, SNOOZE_CUSTOM_BUTTON_ID, withStatusLine } from '../reminder/message.ts';
+import {
+	DONE_BUTTON_ID,
+	type MessagePayload,
+	SNOOZE_BUTTON_ID,
+	SNOOZE_CUSTOM_BUTTON_ID,
+	withStatusLine,
+} from '../reminder/message.ts';
 import { canOperateOccurrence } from '../reminder/permissions.ts';
 import {
 	cancelPendingJobsStatement,
@@ -56,7 +62,8 @@ function parseId(value: string | undefined): number | null {
 /** スヌーズ時間 (分) を解釈する。全角数字も受け付ける。範囲外・不正なら null */
 export function parseSnoozeMinutes(value: string | undefined): number | null {
 	const normalized = value?.normalize('NFKC').trim();
-	if (!normalized || !/^\d{1,4}$/.test(normalized)) {
+	// 先頭の 0 (0000 / 0999 など) は受け付けない
+	if (!normalized || !/^[1-9]\d{0,3}$/.test(normalized)) {
 		return null;
 	}
 	const minutes = Number(normalized);
@@ -184,13 +191,13 @@ export const reminderDoneComponent = factory.component(makeButton(DONE_BUTTON_ID
 	if (!target.ok) {
 		return c.flags('EPHEMERAL').res(target.message);
 	}
-	const completedMessage = (at: number) => ({
+	const completedMessage = (at: number): MessagePayload => ({
 		content: withStatusLine(
 			c.interaction.message?.content ?? '',
 			`✅ <@${target.userId}> が完了しました（${formatJstTime(at)}）`,
 		),
 		components: [],
-		allowed_mentions: { parse: [] as [] },
+		allowed_mentions: { parse: [] },
 	});
 	if (target.occurrence.state === 'completed') {
 		// すでに本人が完了済み (前回の応答が失敗した場合など)。メッセージだけを完了の状態に直す

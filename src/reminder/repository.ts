@@ -361,7 +361,9 @@ export function closeOccurrenceStatement(
 ): DbStatement {
 	const where = condition ? `id = ? AND state = 'open' AND ${condition.sql}` : "id = ? AND state = 'open'";
 	return db
-		.prepare(`UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE ${where} RETURNING id`)
+		.prepare(
+			`UPDATE reminder_occurrences SET state = ?, completed_by = ?, completed_at = ? WHERE ${where} RETURNING id`,
+		)
 		.bind(state, params.by ?? null, params.now, id, ...(condition?.values ?? []));
 }
 

@@ -551,7 +551,7 @@ describe('reminder action buttons', () => {
 			]);
 		});
 
-		it.each(['0', '1441', '1.5', 'abc', '', '-3'])('rejects invalid input %j', async (value) => {
+		it.each(['0', '0000', '0999', '1441', '1.5', 'abc', '', '-3'])('rejects invalid input %j', async (value) => {
 			const { db, occurrenceId, nagJobId } = await setup();
 
 			const body = await send(db, modalInteraction(occurrenceId, value));
