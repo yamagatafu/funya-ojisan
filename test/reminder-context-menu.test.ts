@@ -5,9 +5,11 @@ import {
 	InteractionType,
 	MessageFlags,
 } from 'discord-api-types/v10';
+import { createRest } from 'discord-hono';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { reminderContextMenuHandlers } from '../src/handlers/reminder-context-menu.ts';
 import { jstToUtcMs } from '../src/reminder/date.ts';
+import { dispatchDueJobs } from '../src/reminder/dispatcher.ts';
 import { insertReminder, type JobRow, type ReminderInput, type ReminderRow } from '../src/reminder/repository.ts';
 import { createTestDb } from './helpers/d1.ts';
 import {
@@ -156,6 +158,28 @@ describe('メッセージコンテキストメニュー「このメッセージ�
 		expect(jobs(db)).toEqual([
 			expect.objectContaining({ reminder_id: reminder!.id, kind: 'main', status: 'pending', run_at: runAt }),
 		]);
+	});
+
+	it('登録したリマインダの通知に、元メッセージへのリンクと実行者へのメンションが含まれる', async () => {
+		vi.spyOn(Date, 'now').mockReturnValue(NOW);
+		const db = createTestDb();
+		await send(db, modalSubmitInteraction({ when: '30分', memo: '資料を確認する' }));
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockImplementation(async () => Response.json({ id: 'notification-msg' }));
+
+		const runAt = NOW + 30 * 60 * 1000;
+		await dispatchDueJobs({ db, rest: createRest('test-token'), now: () => runAt });
+
+		const [url, init] = fetchMock.mock.calls[0]!;
+		expect(String(url)).toBe(`https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`);
+		const payload = JSON.parse(String(init?.body));
+		expect(payload.content).toContain(`⏰ <@${USER_ID}> リマインド`);
+		expect(payload.content).toContain('資料を確認する');
+		expect(payload.content).toContain(
+			`🔗 元メッセージ: https://discord.com/channels/${GUILD_ID}/${CHANNEL_ID}/${MESSAGE_ID}`,
+		);
+		expect(payload.allowed_mentions).toEqual({ parse: [], users: [USER_ID] });
 	});
 
 	it('時刻指定 (HH:MM) は JST で解釈する', async () => {
