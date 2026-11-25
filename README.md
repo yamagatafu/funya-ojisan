@@ -133,6 +133,15 @@ pnpm exec wrangler d1 migrations apply funya-ojisan-reminder --local
 pnpm exec wrangler d1 migrations apply funya-ojisan-reminder --remote
 ```
 
+プレビュー環境用に D1 データベースを分離した場合 (`wrangler.jsonc` の `previews.d1_databases` に別の `database_id` を設定した場合) は、そのデータベースにも同じマイグレーションを適用してください。適用しないとテーブルが存在せず、プレビュー環境でリマインダを操作できません。
+
+```bash
+# プレビュー用 (データベース名は previews.d1_databases の database_name に置き換える)
+pnpm exec wrangler d1 migrations apply <プレビュー用のデータベース名> --remote
+```
+
+マイグレーションを追加した場合は、ローカル・本番 (・分離したプレビュー) のそれぞれに再度適用してください。適用済みのものはスキップされます。
+
 ### 4. スラッシュコマンドの登録
 
 ```bash
