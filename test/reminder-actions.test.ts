@@ -325,6 +325,28 @@ describe('reminder action buttons', () => {
 			expect(jobs(db).filter((job) => job.kind === 'snooze')).toHaveLength(0);
 		});
 
+		it('lets the completer repair the message when the previous response was lost', async () => {
+			const { db, occurrenceId } = await setup();
+			// 完了の batch は反映されたが、応答 (メッセージの更新) が届かなかった状況を再現する
+			await closeOccurrence(db, occurrenceId, 'completed', { by: OWNER_ID, now: NOW - MINUTE_MS });
+
+			const body = await send(db, buttonInteraction(`remind_done;${occurrenceId}`, occurrenceId));
+
+			expect(body.type).toBe(7);
+			expect(body.data.content).toBe(`${MESSAGE_CONTENT}\n-# ✅ <@${OWNER_ID}> が完了しました（09:02）`);
+			expect(body.data.components).toEqual([]);
+
+			// 完了した本人以外は、これまでどおり完了済みとして断る
+			const other = await send(
+				db,
+				buttonInteraction(`remind_done;${occurrenceId}`, occurrenceId, {
+					userId: OTHER_ID,
+					permissions: MODERATOR_PERMISSIONS,
+				}),
+			);
+			expectEphemeral(other, 'この通知はすでに完了または終了しています。');
+		});
+
 		it('does not leave a snooze on an occurrence completed concurrently', async () => {
 			const { db, occurrenceId } = await setup();
 			const batch = db.batch.bind(db);

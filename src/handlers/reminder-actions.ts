@@ -68,6 +68,7 @@ async function loadTarget(
 	db: ReminderDb | undefined,
 	interaction: InteractionLike,
 	occurrenceId: number | null,
+	options: { allowCompletedBySelf?: boolean } = {},
 ): Promise<TargetResult> {
 	if (!db) {
 		return { ok: false, message: MESSAGES.notConfigured };
@@ -84,10 +85,12 @@ async function loadTarget(
 	if (!occurrence || !reminder) {
 		return { ok: false, message: MESSAGES.deleted };
 	}
-	if (occurrence.state !== 'open') {
+	const userId = member.user.id;
+	// 完了した本人の再操作は、応答の失敗などで更新されなかったメッセージを直せるよう受け付ける
+	const completedBySelf = occurrence.state === 'completed' && occurrence.completed_by === userId;
+	if (occurrence.state !== 'open' && !(options.allowCompletedBySelf && completedBySelf)) {
 		return { ok: false, message: MESSAGES.closed };
 	}
-	const userId = member.user.id;
 	if (!canOperateOccurrence(reminder, { userId, roles: member.roles, permissions: member.permissions })) {
 		return { ok: false, message: MESSAGES.forbidden };
 	}
@@ -115,7 +118,7 @@ async function snooze(
 	now: number,
 ): Promise<number | null> {
 	const runAt = now + minutes * MINUTE_MS;
-	await db.batch([
+	const results = await db.batch([
 		cancelPendingJobsStatement(
 			db,
 			{
@@ -138,8 +141,8 @@ async function snooze(
 			occurrenceOpenCondition(target.occurrence.id),
 		),
 	]);
-	const occurrence = await getOccurrence(db, target.occurrence.id);
-	return occurrence?.state === 'open' ? runAt : null;
+	// 登録できたかは batch の結果 (RETURNING) で判定する
+	return (results[1]?.results.length ?? 0) > 0 ? runAt : null;
 }
 
 function snoozedContent(interaction: InteractionLike, userId: string, runAt: number): string {
@@ -177,14 +180,27 @@ function buildSnoozeModal(occurrenceId: number): APIModalInteractionResponseCall
 /** ✅ 完了 */
 export const reminderDoneComponent = factory.component(makeButton(DONE_BUTTON_ID, '完了'), async (c) => {
 	const db = c.env.REMINDER_DB;
-	const target = await loadTarget(db, c.interaction, parseId(c.ref.custom_value));
+	const target = await loadTarget(db, c.interaction, parseId(c.ref.custom_value), { allowCompletedBySelf: true });
 	if (!target.ok) {
 		return c.flags('EPHEMERAL').res(target.message);
 	}
+	const completedMessage = (at: number) => ({
+		content: withStatusLine(
+			c.interaction.message?.content ?? '',
+			`✅ <@${target.userId}> が完了しました（${formatJstTime(at)}）`,
+		),
+		components: [],
+		allowed_mentions: { parse: [] as [] },
+	});
+	if (target.occurrence.state === 'completed') {
+		// すでに本人が完了済み (前回の応答が失敗した場合など)。メッセージだけを完了の状態に直す
+		return c.update().res(completedMessage(target.occurrence.completed_at ?? Date.now()));
+	}
 	const now = Date.now();
 	// 未送信の再通知・スヌーズの取り消しと完了への更新は 1 つの batch で行う。
-	// 失敗した場合はどちらも反映されず、回は open のまま残るため、再度押せば完了できる
-	await db.batch([
+	// 失敗した場合はどちらも反映されず、回は open のまま残るため、再度押せば完了できる。
+	// 完了できたかは batch の結果 (RETURNING) で判定し、追加の読み取りはしない
+	const results = await db.batch([
 		cancelPendingJobsStatement(
 			db,
 			{
@@ -196,23 +212,11 @@ export const reminderDoneComponent = factory.component(makeButton(DONE_BUTTON_ID
 		),
 		closeOccurrenceStatement(db, target.occurrence.id, 'completed', { by: target.userId, now }),
 	]);
-	const completed = await getOccurrence(db, target.occurrence.id);
-	if (
-		completed?.state !== 'completed' ||
-		completed.completed_by !== target.userId ||
-		completed.completed_at !== now
-	) {
+	if ((results[1]?.results.length ?? 0) === 0) {
 		// 確認後に他の操作 (置き換え・別の完了) が先に閉じていた
 		return c.flags('EPHEMERAL').res(MESSAGES.closed);
 	}
-	return c.update().res({
-		content: withStatusLine(
-			c.interaction.message?.content ?? '',
-			`✅ <@${target.userId}> が完了しました（${formatJstTime(now)}）`,
-		),
-		components: [],
-		allowed_mentions: { parse: [] },
-	});
+	return c.update().res(completedMessage(now));
 });
 
 /** ⏰ 5分 / 15分 / 30分 (custom_value は `{occurrenceId}:{minutes}`) */
