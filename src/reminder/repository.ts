@@ -121,6 +121,58 @@ export async function insertReminder(db: ReminderDb, input: ReminderInput, now: 
 	return row.id;
 }
 
+/** 件数の上限 (登録・復活時) を満たすことを表す条件。終了済み (ended) のリマインダは数えない */
+export function withinLimitsCondition(
+	params: { guildId: string; ownerId: string },
+	limits: { perUser: number; perGuild: number },
+): ExtraCondition {
+	return {
+		sql: "(SELECT COUNT(*) FROM reminders WHERE guild_id = ? AND owner_id = ? AND status != 'ended') < ? AND (SELECT COUNT(*) FROM reminders WHERE guild_id = ? AND status != 'ended') < ?",
+		values: [params.guildId, params.ownerId, limits.perUser, params.guildId, limits.perGuild],
+	};
+}
+
+/**
+ * リマインダと最初の通知ジョブを 1 つの batch (トランザクション) で登録する SQL 文を組み立てる。
+ * - リマインダは件数の上限を満たす場合だけ登録する (件数の確認と登録を 1 つの文で行う)
+ * - ジョブは、直前の文が 1 行登録した場合 (changes() = 1) だけ、その行 (last_insert_rowid()) に紐づけて登録する。
+ *   上限で登録されなかった場合はジョブも登録されない
+ * 1 つ目の文の結果 (RETURNING id) が空なら、上限で登録されなかったことを表す。
+ */
+export function insertReminderWithFirstJobsStatements(
+	db: ReminderDb,
+	input: ReminderInput,
+	first: { runAt: number; preRunAt: number | null },
+	limits: { perUser: number; perGuild: number },
+	now: number,
+): DbStatement[] {
+	const columns = [...REMINDER_INPUT_COLUMNS, 'status', 'next_run_at', 'created_at', 'updated_at'];
+	const values = [...REMINDER_INPUT_COLUMNS.map((column) => input[column]), 'active', first.runAt, now, now];
+	const limit = withinLimitsCondition({ guildId: input.guild_id, ownerId: input.owner_id }, limits);
+	const statements = [
+		db
+			.prepare(
+				`INSERT INTO reminders (${columns.join(', ')}) SELECT ${columns.map(() => '?').join(', ')} WHERE ${limit.sql} RETURNING id`,
+			)
+			.bind(...values, ...limit.values),
+		db
+			.prepare(
+				"INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) SELECT last_insert_rowid(), NULL, 'main', ?, ?, 'pending', ? WHERE changes() = 1",
+			)
+			.bind(first.runAt, first.runAt, now),
+	];
+	if (first.preRunAt !== null) {
+		statements.push(
+			db
+				.prepare(
+					"INSERT INTO reminder_jobs (reminder_id, occurrence_id, kind, run_at, scheduled_at, status, updated_at) SELECT reminder_id, NULL, 'pre', ?, ?, 'pending', ? FROM reminder_jobs WHERE id = last_insert_rowid() AND changes() = 1",
+				)
+				.bind(first.preRunAt, first.runAt, now),
+		);
+	}
+	return statements;
+}
+
 export function getReminder(db: ReminderDb, id: number): Promise<ReminderRow | null> {
 	return db.prepare('SELECT * FROM reminders WHERE id = ?').bind(id).first<ReminderRow>();
 }
@@ -191,7 +243,7 @@ export function updateReminderStatement(
 	const assignments = [...entries.map(([column]) => `${column} = ?`), 'revision = revision + 1', 'updated_at = ?'];
 	const where = condition ? `id = ? AND ${condition.sql}` : 'id = ?';
 	return db
-		.prepare(`UPDATE reminders SET ${assignments.join(', ')} WHERE ${where}`)
+		.prepare(`UPDATE reminders SET ${assignments.join(', ')} WHERE ${where} RETURNING id`)
 		.bind(...entries.map(([, value]) => value), now, id, ...(condition?.values ?? []));
 }
 
