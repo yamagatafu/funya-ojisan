@@ -24,7 +24,8 @@ export const REMINDER_CHANNEL_TYPES = [
 	ChannelType.PrivateThread,
 	ChannelType.AnnouncementThread,
 ] as const;
-const REMINDER_CHANNEL_TYPE_SET = new Set<number>(REMINDER_CHANNEL_TYPES);
+/** 通知先にできるチャンネル種別 (判定用) */
+export const REMINDER_CHANNEL_TYPE_SET = new Set<number>(REMINDER_CHANNEL_TYPES);
 
 export function hasPermission(permissions: string | undefined | null, flag: bigint): boolean {
 	if (!permissions) {
