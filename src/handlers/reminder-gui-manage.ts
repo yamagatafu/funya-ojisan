@@ -10,6 +10,7 @@
  */
 import {
 	type APIActionRowComponent,
+	type APIAllowedMentions,
 	type APIButtonComponentWithCustomId,
 	type APIComponentInMessageActionRow,
 	ButtonStyle,
@@ -204,6 +205,37 @@ export const manageEditComponent = factory.component(makeButton(MANAGE_EDIT_BUTT
 });
 
 /** [一時停止] / [再開] */
+/**
+ * 一時停止・再開を行い、結果の本文と新しい状態に合わせた操作ボタンを返す。
+ * 見つからない・操作できない場合は handlePause / handleResume がその旨を返す。
+ * 期待した状態にならなかった (権限不足などで失敗した) 場合は、案内の下にリマインダの要約を残す
+ */
+async function toggleReminder(
+	inv: Invocation,
+	action: ToggleAction,
+): Promise<ReplyMessage & { allowed_mentions: APIAllowedMentions }> {
+	let reply: Reply;
+	try {
+		reply = action === 'pause' ? await handlePause(inv) : await handleResume(inv);
+	} catch (error) {
+		console.error(`Unexpected error in reminder manage ${action}:`, error);
+		// components を含めないため、メッセージのボタンはそのまま残る
+		return replyData(MESSAGES.error);
+	}
+	// pause / resume は文字列だけを返す (遅延応答・メッセージ形式は想定外)
+	if (typeof reply !== 'string') {
+		return replyData(MESSAGES.error);
+	}
+	const saved = await findManageableReminder(inv);
+	if (!saved) {
+		return replyData({ message: { content: reply, components: [] } });
+	}
+	const succeeded =
+		action === 'pause' ? saved.status === 'paused' : saved.status === 'active' || saved.status === 'ended';
+	const content = succeeded ? reply : `${reply}\n\n${manageView(saved).content}`;
+	return replyData({ message: { content, components: buildManageButtons(saved) } });
+}
+
 export const manageToggleComponent = factory.component(
 	makeButton(MANAGE_TOGGLE_BUTTON_ID, '一時停止 / 再開'),
 	async (c) => {
@@ -213,26 +245,10 @@ export const manageToggleComponent = factory.component(
 			return c.flags('EPHEMERAL').res(replyData(prepared.ok ? MESSAGES.invalid : prepared.message));
 		}
 		const { inv } = prepared;
-		const before = await findManageableReminder(inv);
-		if (!before) {
-			return c.flags('EPHEMERAL').res(replyData(notFound(toggle.id)));
-		}
-		let reply: Reply;
-		try {
-			reply = toggle.action === 'pause' ? await handlePause(inv) : await handleResume(inv);
-		} catch (error) {
-			console.error(`Unexpected error in reminder manage ${toggle.action}:`, error);
-			return c.flags('EPHEMERAL').res(replyData(MESSAGES.error));
-		}
-		if (typeof reply !== 'string') {
-			// pause / resume は文字列だけを返す (遅延応答・メッセージ形式は想定外)
-			return c.flags('EPHEMERAL').res(replyData(MESSAGES.error));
-		}
-		// 結果の本文に、新しい状態に合わせた操作ボタンを付け直す (権限不足などで失敗した場合も操作を続けられるように)
-		const saved = await findManageableReminder(inv);
-		// 状態が変わらなかった (権限不足などで失敗した) 場合は、案内の下にリマインダの要約を残す
-		const content = saved && saved.status === before.status ? `${reply}\n\n${manageView(saved).content}` : reply;
-		return c.update().res(replyData({ message: { content, components: saved ? buildManageButtons(saved) : [] } }));
+		// D1 へのアクセスは、Discord の初回応答の期限 (3 秒) に間に合わせるため遅延応答の後に行う
+		return c.update().resDefer(async (d) => {
+			await d.followup(await toggleReminder(inv, toggle.action));
+		});
 	},
 );
 
@@ -257,29 +273,19 @@ export const manageDeleteConfirmComponent = factory.component(
 		if (!prepared.ok) {
 			return c.flags('EPHEMERAL').res(replyData(prepared.message));
 		}
-		// handleDelete も findManageableReminder で確認する。見つからない場合はメッセージを変えずに知らせる
 		const { inv } = prepared;
-		if (!(await findManageableReminder(inv))) {
-			return c.flags('EPHEMERAL').res(replyData(notFound(prepared.id)));
-		}
-		let reply: Reply;
-		try {
-			reply = await handleDelete(inv);
-		} catch (error) {
-			console.error('Unexpected error in reminder manage delete:', error);
-			return c.flags('EPHEMERAL').res(replyData(MESSAGES.error));
-		}
-		if (typeof reply === 'string' || 'message' in reply) {
-			return c
-				.update()
-				.res(replyData(typeof reply === 'string' ? { message: { content: reply, components: [] } } : reply));
-		}
-		const { deferred } = reply;
-		// 通知のボタンを REST で外してから、確認メッセージを結果に書き換える
+		// D1 へのアクセスと通知のボタンの除去 (REST) は、初回応答の期限に間に合わせるため遅延応答の後に行う。
+		// 見つからない・操作できない場合は handleDelete がその旨を返す
 		return c.update().resDefer(async (d) => {
 			let content: string;
 			try {
-				content = await deferred(d.rest);
+				const reply = await handleDelete(inv);
+				content =
+					typeof reply === 'string'
+						? reply
+						: 'message' in reply
+							? reply.message.content
+							: await reply.deferred(d.rest);
 			} catch (error) {
 				console.error('Unexpected error in reminder manage delete:', error);
 				content = MESSAGES.error;

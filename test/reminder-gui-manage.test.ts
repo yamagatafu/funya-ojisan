@@ -107,6 +107,23 @@ async function send(db: TestDb, interaction: Record<string, unknown>): Promise<B
 	return (await response.json()) as Body;
 }
 
+/**
+ * 遅延応答 (type 6) を返す操作を送り、フォローアップ (元のメッセージの書き換え) の内容を返す。
+ * D1 へのアクセスを初回応答の後に行う操作 (一時停止・再開・削除の確定) 用
+ */
+async function sendDeferred(db: TestDb, interaction: Record<string, unknown>): Promise<Body> {
+	const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({}));
+	try {
+		const body = await send(db, interaction);
+		expect(body.type).toBe(6);
+		const followup = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/messages/@original')).at(-1);
+		expect(followup?.[1]?.method).toBe('PATCH');
+		return { type: body.type, data: JSON.parse(String(followup?.[1]?.body)) };
+	} finally {
+		fetchMock.mockRestore();
+	}
+}
+
 function listCommand(actor: Actor = {}, all = false) {
 	return {
 		...baseInteractionFields({ member: createMember(actor) }),
@@ -316,14 +333,12 @@ describe('[一時停止] / [再開]', () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
 
-		const paused = await send(db, button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:pause`));
-		expect(paused.type).toBe(7);
+		const paused = await sendDeferred(db, button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:pause`));
 		expect(paused.data?.content).toContain(`⏸️ リマインダ #${reminder.id} を一時停止しました`);
 		expect(rows(paused)[0]?.[1]).toMatchObject({ label: '再開', style: ButtonStyle.Success });
 		expect((await getReminder(db, reminder.id))?.status).toBe('paused');
 
-		const resumed = await send(db, button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:resume`));
-		expect(resumed.type).toBe(7);
+		const resumed = await sendDeferred(db, button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:resume`));
 		expect(resumed.data?.content).toContain(`▶️ リマインダ #${reminder.id} を再開しました`);
 		expect(rows(resumed)[0]?.[1]?.label).toBe('一時停止');
 		expect((await getReminder(db, reminder.id))?.status).toBe('active');
@@ -332,7 +347,7 @@ describe('[一時停止] / [再開]', () => {
 	it('状態が変わっていれば、既存のコマンドと同じメッセージを返す', async () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
-		const body = await send(db, button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:resume`));
+		const body = await sendDeferred(db, button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:resume`));
 		expect(body.data?.content).toContain('再開できません');
 		expect(rows(body)[0]?.[1]?.label).toBe('一時停止');
 	});
@@ -341,7 +356,7 @@ describe('[一時停止] / [再開]', () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
 		await updateReminder(db, reminder.id, { status: 'paused', next_run_at: null }, NOW);
-		const body = await send(
+		const body = await sendDeferred(
 			db,
 			button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:resume`, { permissions: String(1n << 10n) }),
 		);
@@ -364,13 +379,12 @@ describe('[一時停止] / [再開]', () => {
 		const reminder = await seed(db);
 		const other = await seed(db, { guild_id: OTHER_GUILD_ID });
 
-		const denied = await send(
+		const denied = await sendDeferred(
 			db,
 			button(`${MANAGE_TOGGLE_BUTTON_ID};${reminder.id}:pause`, { userId: OTHER_USER_ID }),
 		);
-		expect(denied.type).toBe(4);
 		expect(denied.data?.content).toContain('見つかりません');
-		const foreign = await send(
+		const foreign = await sendDeferred(
 			db,
 			button(`${MANAGE_TOGGLE_BUTTON_ID};${other.id}:pause`, { permissions: SERVER_MANAGER_PERMISSIONS }),
 		);
@@ -411,9 +425,8 @@ describe('[削除]', () => {
 		const db = createTestDb();
 		const reminder = await seed(db);
 
-		const body = await send(db, button(`${MANAGE_DELETE_CONFIRM_BUTTON_ID};${reminder.id}`));
+		const body = await sendDeferred(db, button(`${MANAGE_DELETE_CONFIRM_BUTTON_ID};${reminder.id}`));
 
-		expect(body.type).toBe(7);
 		expect(body.data?.content).toBe(`🗑️ リマインダ #${reminder.id} を削除しました。`);
 		expect(body.data?.components).toEqual([]);
 		expect(await getReminder(db, reminder.id)).toBeNull();
@@ -458,7 +471,7 @@ describe('[削除]', () => {
 		const reminder = await seed(db);
 		const other = await seed(db, { guild_id: OTHER_GUILD_ID });
 
-		for (const id of [MANAGE_DELETE_BUTTON_ID, MANAGE_DELETE_CONFIRM_BUTTON_ID, MANAGE_DELETE_CANCEL_BUTTON_ID]) {
+		for (const id of [MANAGE_DELETE_BUTTON_ID, MANAGE_DELETE_CANCEL_BUTTON_ID]) {
 			const denied = await send(db, button(`${id};${reminder.id}`, { userId: OTHER_USER_ID }));
 			expect(denied.type).toBe(4);
 			expect(denied.data?.flags).toBe(EPHEMERAL);
@@ -466,6 +479,17 @@ describe('[削除]', () => {
 			const foreign = await send(db, button(`${id};${other.id}`, { permissions: SERVER_MANAGER_PERMISSIONS }));
 			expect(foreign.data?.content).toContain('見つかりません');
 		}
+		// [削除する] は遅延応答の後に確認し、確認メッセージを結果に書き換える
+		const denied = await sendDeferred(
+			db,
+			button(`${MANAGE_DELETE_CONFIRM_BUTTON_ID};${reminder.id}`, { userId: OTHER_USER_ID }),
+		);
+		expect(denied.data?.content).toContain('見つかりません');
+		const foreign = await sendDeferred(
+			db,
+			button(`${MANAGE_DELETE_CONFIRM_BUTTON_ID};${other.id}`, { permissions: SERVER_MANAGER_PERMISSIONS }),
+		);
+		expect(foreign.data?.content).toContain('見つかりません');
 		expect(await getReminder(db, reminder.id)).not.toBeNull();
 		expect(await getReminder(db, other.id)).not.toBeNull();
 	});
