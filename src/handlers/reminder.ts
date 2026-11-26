@@ -4,6 +4,7 @@ import { reminderActionHandlers } from './reminder-actions.ts';
 import { reminderCommandHandlers } from './reminder-commands.ts';
 import { reminderContextMenuHandlers } from './reminder-context-menu.ts';
 import { reminderGuiBaseHandlers } from './reminder-gui-base.ts';
+import { reminderGuiDetailHandlers } from './reminder-gui-details.ts';
 
 export const REMINDER_CRON = '* * * * *';
 
@@ -21,4 +22,5 @@ export const reminderHandlers = [
 	...reminderActionHandlers,
 	...reminderContextMenuHandlers,
 	...reminderGuiBaseHandlers,
+	...reminderGuiDetailHandlers,
 ];
